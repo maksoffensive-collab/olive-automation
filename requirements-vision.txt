@@ -1,0 +1,9 @@
+# Optional computer-vision acceleration: fast, scale-aware picture search (the person's approval of 2026-10-20).
+# The application runs without it -- the standard-library matcher stays -- so nothing outside the vision provider may
+# import these. Install into the project's own .venv, never globally:
+#
+#     .venv\Scripts\python.exe -m pip install -r requirements-vision.txt
+#
+# Every entry is pinned to an exact version and explained in docs/DEPENDENCIES.md.
+numpy==2.5.4
+opencv-python-headless==5.0.0.93

@@ -1,0 +1,10 @@
+# Development tools for working ON this project. Not needed to run the application or its tests, which use the
+# Python standard library only. Install into the project's own .venv, never globally:
+#
+#     .venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+#
+# Every entry is pinned to an exact version and explained in docs/DEPENDENCIES.md.
+ruff==0.17.0
+# Builds the Windows release (scripts/build_release.py, docs/RELEASE.md); the hooks package decides what goes in.
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9

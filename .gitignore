@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Runtime data: never commit device identifiers, screenshots, or logs
+data/
+diagnostics/
+logs/
+*.log
+
+# Local secrets (API keys must come from the environment, never files in the repo)
+.env
+*.key
+secrets.*
+
+# Real user macros are never copied here
+*.record
+!tests/fixtures/synthetic/*.record

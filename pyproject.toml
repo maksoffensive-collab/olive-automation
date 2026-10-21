@@ -1,0 +1,29 @@
+[project]
+name = "ldplayer-automation-platform"
+version = "0.9.0b1"            # the same as app.__version__ (tests.test_bootstrap_main.Version)
+description = "Olive Automation: a provider-independent Windows automation platform"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[project.optional-dependencies]
+# Optional fast, scale-aware picture search (requirements-vision.txt, docs/DEPENDENCIES.md); the application runs
+# without it.
+vision = ["numpy==2.5.4", "opencv-python-headless==5.0.0.93"]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+# Development tools only (requirements-dev.txt, docs/DEPENDENCIES.md): nothing in app/ or tests/ imports them.
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+# Deliberately minimal: only defects that crash at runtime -- syntax errors (E9), invalid comparisons and asserts
+# (F63), misplaced statements (F7) and undefined names (F82). The code base is clean for these, so every finding is
+# new. Broader rules (unused imports, bugbear, style) are an opt-in cleanup decision, not a gate; the formatter is
+# not adopted (it would rewrite every file). See docs/STATUS.md.
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.ruff.lint.per-file-ignores]
+# `-> "LogEvent"` quotes a name the helper imports locally; the annotation is never evaluated.
+"tests/test_core_config_logging.py" = ["F821"]
