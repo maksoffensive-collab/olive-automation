@@ -18,7 +18,29 @@ MAX_PIXELS = 64_000_000  # refuse absurd images (decompression bombs)
 
 
 class VisionError(PlatformError):
-    pass
+    """A refusal of the picture code. One a person can meet names itself in `code` and carries its numbers in
+    `params`, so a screen can say it in the person's language; the message is the English wording of the same."""
+
+    def __init__(self, message: str = "", *, code: str = "", **params) -> None:
+        super().__init__(message)
+        self.code = code
+        self.params = params
+
+
+_FAST: list = []                # [the fast module, or None], filled on first use
+
+
+def fast_module():
+    """`app.vision.fast` when OpenCV and NumPy can be loaded, else None (looked up once): the picture search and
+    PNG decoding use it when it is there, and work without it."""
+    if not _FAST:
+        try:
+            from . import fast
+        except ImportError:
+            _FAST.append(None)
+        else:
+            _FAST.append(fast)
+    return _FAST[0]
 
 
 @dataclass(frozen=True)
@@ -146,7 +168,7 @@ def _unfilter(raw: bytes, width: int, height: int, bpp: int) -> list[bytearray]:
 def decode_png(data: bytes) -> Bitmap:
     if not data.startswith(_SIGNATURE):
         raise VisionError("Not a PNG file (bad signature).")
-    pos, ihdr, idat, seen_end = 8, None, [], False
+    pos, ihdr, idat, seen_end, animated = 8, None, [], False, False
     while pos + 8 <= len(data):
         length, kind = struct.unpack(">I4s", data[pos:pos + 8])
         body = data[pos + 8:pos + 8 + length]
@@ -160,6 +182,8 @@ def decode_png(data: bytes) -> Bitmap:
             ihdr = body
         elif kind == b"IDAT":
             idat.append(body)
+        elif kind == b"acTL":
+            animated = True                            # an APNG: its IDAT picture is the one read here
         elif kind == b"IEND":
             seen_end = True
             break
@@ -182,6 +206,13 @@ def decode_png(data: bytes) -> Bitmap:
         raise VisionError("PNG pixel data is larger than its declared size.")
     if not inflater.eof:
         raise VisionError("PNG pixel data is incomplete (truncated compressed stream).")
+    if len(raw) != expected:
+        raise VisionError("PNG pixel data has an unexpected length.")
+    fast = None if animated else fast_module()      # OpenCV might read an animation's own frame instead
+    if fast is not None:                               # the same values, unfiltered in C: a screen in milliseconds
+        rgb = fast.decode_png(data, width, height)
+        if rgb is not None:
+            return Bitmap(width, height, rgb)
     out = bytearray()
     for row in _unfilter(raw, width, height, bpp):
         if ctype == 2:

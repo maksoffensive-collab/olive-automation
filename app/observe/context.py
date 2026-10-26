@@ -33,12 +33,12 @@ from app.core.cancel import EmergencyStop
 from app.core.errors import EmergencyStopped, PlatformError
 from app.ocr.provider import OcrProvider, OcrResult
 from app.providers.base import FrameSource, ScreenshotProvider
-from app.providers.size import check_size, fit
+from app.providers.size import check_size, factors, fit
 from app.vision.frame import Frame
 from app.vision.roi import Roi
 
 from .errors import ObservationCancelled, ObservationError, ObservationTimeout, ObservationUnavailable
-from .observer import check_any_size, check_text_reader, observe, read_text
+from .observer import check_template_query, check_text_reader, observe, read_text
 from .query import Query, TemplateQuery, TextLinesQuery, TextQuery
 from .result import ObservationResult
 from .scale import scaled_query
@@ -47,6 +47,7 @@ MAX_TIMEOUT_S = 600.0        # ten minutes: long enough for any real wait, short
 MIN_INTERVAL_S = 0.05        # never poll a provider faster than this, whatever a caller asks for
 DEFAULT_INTERVAL_S = 0.5
 MAX_PICTURE_BYTES = 128 << 20   # pictures kept at another size per context (a WAIT UNTIL looks again and again)
+UNCOVERED_WAIT_S = 0.25      # a target that `prepare` had to uncover gets this long to draw itself before the look
 
 
 class ObservationContext:
@@ -54,7 +55,7 @@ class ObservationContext:
 
     def __init__(self, provider: ScreenshotProvider, *, stop: EmergencyStop | None = None,
                  ocr: OcrProvider | None = None, clock: Callable[[], float] = time.monotonic,
-                 picked_on: tuple[int, int] | None = None) -> None:
+                 picked_on: tuple[int, int] | None = None, prepare: Callable[[], bool] | None = None) -> None:
         if not isinstance(provider, ScreenshotProvider):
             raise ObservationUnavailable("An observation context needs a ScreenshotProvider bound to a "
                                          "verified target.")
@@ -62,6 +63,11 @@ class ObservationContext:
         # the size the queries' points, areas and pictures were picked at: each is scaled to the frame it is asked of
         # (app/observe/scale.py); None asks them as they are
         self.picked_on = check_size(picked_on, "picked_on")
+        # called before each fresh screenshot of a run: the target made seen on this computer's screen (its window
+        # brought to the front, say); True when it was hidden or covered -- it then gets UNCOVERED_WAIT_S to draw
+        # itself, on the stop -- a program that stops drawing while covered would otherwise show a stale picture
+        self._prepare = prepare
+        self._settle_pending = False           # `settle_next`: the next fresh look waits first, whatever `prepare` says
         self._pictures: dict = {}              # (picture, w, h) -> it at that size: each made once, this context's own
         self._picture_bytes = 0
         self._stop = stop
@@ -112,6 +118,10 @@ class ObservationContext:
             if self._frame is not None and max_age_s > 0 and (self._clock() - self._captured_mono) <= max_age_s:
                 return self._frame, self._captured_at
             try:
+                uncovered = self._prepare() if self._prepare is not None else False
+                if uncovered or self._settle_pending:
+                    self._settle_pending = False
+                    self._settle()
                 shot = self._provider.capture()
                 frame = Frame.from_screenshot(shot)
             except EmergencyStopped:
@@ -126,6 +136,19 @@ class ObservationContext:
             self._captured_mono = self._clock()
             self.captures += 1
             return frame, self._captured_at
+
+    def settle_next(self) -> None:
+        """The next fresh look waits UNCOVERED_WAIT_S first: the target was uncovered by someone else just before
+        (at the start of a run), so by the time of that look it is no longer covered, yet may not have drawn."""
+        self._settle_pending = True
+
+    def _settle(self) -> None:
+        """Let a target that was just uncovered draw itself: UNCOVERED_WAIT_S, ended at once by the stop."""
+        if self._stop is not None:
+            if self._stop.wait(UNCOVERED_WAIT_S):
+                self._stop.check()
+        else:
+            time.sleep(UNCOVERED_WAIT_S)
 
     def forget(self) -> None:
         """Drop the cached frame, so the next observation captures a fresh one."""
@@ -158,20 +181,22 @@ class ObservationContext:
 
     def check_can_answer(self, query: Query) -> None:
         """Raise now if this context could never answer `query` -- a text query with no OCR reader, or in a language
-        the reader cannot be asked for -- without capturing or reading anything."""
+        the reader cannot be asked for; a picture in any size without the fast search, or of one flat colour --
+        without capturing or reading anything."""
         if isinstance(query, (TextQuery, TextLinesQuery)):
             check_text_reader(self._ocr, query)
         if isinstance(query, TemplateQuery):
-            check_any_size(query)
+            check_template_query(query)
 
-    def observe(self, query: Query, *, max_age_s: float = 0.0,
-                cancel: threading.Event | None = None) -> ObservationResult:
+    def observe(self, query: Query, *, max_age_s: float = 0.0, cancel: threading.Event | None = None,
+                picked_on: tuple[int, int] | None = None) -> ObservationResult:
         """`cancel` is the caller's own cancel: an OCR read under way ends promptly when it is set
-        (`ObservationCancelled`). If the emergency stop is set too, the stop is what is raised."""
+        (`ObservationCancelled`). If the emergency stop is set too, the stop is what is raised. `picked_on`: the size
+        THIS query's point, area or picture was picked at, when it has one of its own (else the context's)."""
         frame, captured_at = self._frame_with_time(max_age_s)
         try:
-            return observe(frame, self._fitted(query, frame), ocr=self._ocr, captured_at=captured_at, cancel=cancel,
-                           check=lambda: self._interrupt(cancel), resize=self._resized)
+            return observe(frame, self._fitted(query, frame, picked_on), ocr=self._ocr, captured_at=captured_at,
+                           cancel=cancel, check=lambda: self._interrupt(cancel))
         except ObservationCancelled:
             self._check_stop()                  # the stop outranks a cancel that happened at the same time
             raise
@@ -185,7 +210,7 @@ class ObservationContext:
             raise ObservationError("observe_all needs at least one query; an empty list observes nothing.")
         frame, captured_at = self._frame_with_time(max_age_s)
         return tuple(observe(frame, self._fitted(q, frame), ocr=self._ocr, captured_at=captured_at,
-                             check=lambda: self._interrupt(None), resize=self._resized) for q in queries)
+                             check=lambda: self._interrupt(None)) for q in queries)
 
     def _interrupt(self, cancel: threading.Event | None) -> None:
         """Between the parts of one look: the stop, then the caller's cancel, end it."""
@@ -206,18 +231,21 @@ class ObservationContext:
                 self._picture_bytes += len(found.rgb)
         return found
 
-    def _fitted(self, query: Query, frame: Frame) -> Query:
-        """`query` at this frame's size, when its own size is known and differs (`SizeChanged` for other
-        proportions: what was at a point may be elsewhere entirely, so nothing is guessed)."""
-        if self.picked_on is None:
+    def _fitted(self, query: Query, frame: Frame, picked_on=None) -> Query:
+        """`query` at this frame's size, when its own size (`picked_on`, else the context's) is known and differs --
+        in any proportions, each direction by its own factor: a query only looks (app/providers/size.py)."""
+        picked_on = self.picked_on if picked_on is None else check_size(picked_on, "picked_on")
+        if picked_on is None:
             return query
-        factors = fit(self.picked_on, (frame.width, frame.height))
-        return query if factors is None else scaled_query(query, *factors, frame.width, frame.height,
-                                                          resize=self._resized)
+        scale = factors(picked_on, (frame.width, frame.height))
+        return query if scale is None else scaled_query(query, *scale, frame.width, frame.height,
+                                                        resize=self._resized)
 
     def scale(self) -> tuple[float, float]:
         """(sx, sy) from the size the queries were picked at to the frame last looked at: what a distance set at
-        that size -- a click beside the match -- is multiplied by. (1, 1) when nothing is scaled."""
+        that size -- a click beside the match -- is multiplied by. (1, 1) when nothing is scaled. Only for the same
+        proportions (`SizeChanged` otherwise): a look follows any size, but a click at a distance from what was
+        found lands on a point nobody looked at, and stretched it would land somewhere else."""
         with self._lock:
             frame = self._frame
         if self.picked_on is None or frame is None:
@@ -225,14 +253,23 @@ class ObservationContext:
         return fit(self.picked_on, (frame.width, frame.height)) or (1.0, 1.0)
 
     def check_size(self, queries: Iterable[Query] = ()) -> None:
-        """Raise now -- a fresh look, before anything is done -- if the target's proportions are no longer those the
-        queries were picked at (`SizeChanged`), or if one of `queries` cannot be asked at the size it has now (a
-        picture that would be too small: `InvalidQuery`)."""
+        """Raise now -- a fresh look, before anything is done -- if one of `queries` cannot be asked at the size the
+        target has now (a picture that would be too small, or made flat: `InvalidQuery`)."""
         if self.picked_on is not None:
             frame, _ = self._frame_with_time(0.0)
-            fit(self.picked_on, (frame.width, frame.height))
             for query in queries:
-                self._fitted(query, frame)
+                fitted = self._fitted(query, frame)
+                if isinstance(fitted, TemplateQuery):
+                    check_template_query(fitted)      # a picture made flat by its new size
+
+    def check_sizes(self, parts) -> None:
+        """`check_size` for queries each picked at a size of its own: (query, size) pairs -- a fresh look, before
+        anything is done; `InvalidQuery` for a picture that would be too small, or made flat, at the size now."""
+        frame, _ = self._frame_with_time(0.0)
+        for query, picked_on in parts:
+            fitted = self._fitted(query, frame, picked_on)
+            if isinstance(fitted, TemplateQuery):
+                check_template_query(fitted)
 
     def wait_until(self, query: Query, *, timeout_s: float, interval_s: float = DEFAULT_INTERVAL_S,
                    ) -> ObservationResult:

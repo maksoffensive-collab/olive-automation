@@ -37,6 +37,12 @@ from app.providers.target import Capability, Target, TargetVerification, Verific
 _MINT = object()
 
 
+def _debug_off(label: str) -> str:
+    return (f"{label} has ADB debugging turned off in its LDPlayer settings, so nothing can control it over ADB. In "
+            "LDPlayer open Settings > Other settings > ADB debugging, choose \"Open local connection\", save, and "
+            "restart the instance.")
+
+
 class Verdict(Enum):
     MATCH = "match"
     MISMATCH = "mismatch"
@@ -171,6 +177,39 @@ class MappingService:
             self._stop.check()                      # a stop that killed the command is a stop, not a refusal
             raise self._fail(profile, "ldconsole_error", f"ldconsole could not be queried: {exc}") from None
 
+    def _devices(self, profile: InstanceProfile) -> list:
+        """The connected, authorised ADB devices. A server that is not running is started in the background when
+        this client may start it (the application's may) -- never waited for here: verifying runs on the window's
+        thread, which also carries the emergency stop -- and the person is asked to choose again in a moment; a start
+        that failed is said, with its reason, at the next choice. An ADB command ended by the emergency stop is the
+        stop, never a refusal."""
+        try:
+            listed = self._adb.list_devices()
+        except AdbServerNotRunning:
+            self._stop.check()                      # a stop at this moment is the stop, never a refusal
+            if getattr(self._adb, "may_start_server", False):
+                failure = getattr(self._adb, "take_start_failure", lambda: None)()
+                if failure is not None:             # said once; the next choice starts it again
+                    raise self._fail(profile, "adb_server", f"{failure} Choose the instance again to try once "
+                                                            "more.") from None
+                self._adb.start_server_soon()
+                raise self._fail(profile, "adb_starting",
+                                 "The ADB server was not running; it is being started now. Choose the instance again "
+                                 "in a few seconds.") from None
+            raise self._fail(profile, "adb_server",
+                             "The ADB server is not running, so the instance cannot be verified.") from None
+        except AdbError as exc:
+            self._stop.check()                      # a stop that killed the command is a stop, not a refusal
+            raise self._fail(profile, "adb_error", f"ADB could not be queried: {exc}") from None
+        return [d for d in listed if d.state is DeviceState.DEVICE]
+
+    def _adb_debug_off(self, index: int) -> bool:
+        """Whether the instance's own settings say its ADB debugging is off (unknown or unreadable: not said)."""
+        try:
+            return self._read_config(index).adb_debug == 0
+        except PlatformError:
+            return False
+
     def probe(self, logical_id: str) -> tuple[LDInstance, list[tuple[str, tuple[Evidence, ...]]]]:
         """Collect evidence for every connected ADB device WITHOUT deciding. For diagnostics.
 
@@ -185,6 +224,8 @@ class MappingService:
         label = profile.label()
         matches = [(serial, evidence) for serial, evidence in per_device
                    if all(e.verdict is Verdict.MATCH for e in evidence)]
+        if not matches and self._adb_debug_off(inst.index):
+            raise self._fail(profile, "adb_debug_off", _debug_off(label))
         if not matches:
             raise self._fail(profile, "no_verified_serial",
                              f"None of the {len(devices)} connected ADB device(s) could be proven to be {label}. "
@@ -220,13 +261,10 @@ class MappingService:
             raise self._fail(profile, "not_running", f"{label} (LDPlayer instance {inst.index}) is not running. Start it first.")
 
         self._stop.check()
-        try:
-            devices = [d for d in self._adb.list_devices() if d.state is DeviceState.DEVICE]
-        except AdbServerNotRunning:
-            raise self._fail(profile, "adb_server", "The ADB server is not running, so the instance cannot be verified.") from None
-        except AdbError as exc:
-            raise self._fail(profile, "adb_error", f"ADB could not be queried: {exc}") from None
+        devices = self._devices(profile)
         if not devices:
+            if self._adb_debug_off(inst.index):
+                raise self._fail(profile, "adb_debug_off", _debug_off(label))
             raise self._fail(profile, "no_adb_device", f"{label} is running but no ADB device is connected and authorised.")
 
         try:

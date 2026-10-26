@@ -302,7 +302,7 @@ class MultiTargetRun(Base):
         self.prepare("Notes", "Calculator")
         self.c.start_run()
         self.assertTrue(self.c.cancel())
-        self.assertIn("Stopping", self.c.status.text)               # not "stopped" until the engine confirms
+        self.assertIn("no new action is sent", self.c.status.text)   # the outcome per target: once engines end
         self.run_to_end()
         states = [r.state for r in self.c.run_results]
         self.assertIn(RunState.STOPPED, states)
@@ -353,7 +353,9 @@ class RunTargetsBelongToTheirMacro(Base):
     confirming them again for that macro -- and an empty choice still never widens into "all"."""
 
     def two_macros(self):
-        first, second = self.saved("First"), self.saved("Second")
+        """First recorded and saved; Second copied into the library, so it remembers no target of its own
+        (item 12 of 2026-10-25: a recorded one would have the window it was recorded on)."""
+        first, second = self.saved("First"), self.copied_in("Second")
         self.c.select_macro(first)
         self.c.set_run_refs([self.entry("Notes").ref, self.entry("Calculator").ref])
         return first, second

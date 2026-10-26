@@ -10,6 +10,8 @@
     create_playback create_window_playback (WindowInputSession: handle-addressed messages only) or, for Full
                     Windows, create_desktop_playback (DesktopInputSession, watched by DesktopRunGuard)
     guard_run       for Full Windows, the run-wide watch for the person taking over (Esc, a click, the mouse moved)
+    bring_to_front  a run's window restored, raised and (at the start) made the main window; sends no input
+    escape_watch    Esc anywhere stops a live run (EscapeWatch) -- not needed by Full Windows, which has its own
 
 Full Windows takes input on the person's explicit decision of 2026-10-19; see app/windows/desktop.py for every
 safeguard.
@@ -35,6 +37,7 @@ from app.providers.target import Target
 from app.windows.backend import WindowInfo, WindowInputBackend, WindowObservationBackend
 from app.windows.ids import PROVIDER_ID
 from app.windows.desktop import DesktopRunGuard
+from app.windows.escape import EscapeWatch
 from app.windows.playback import create_desktop_playback, create_window_playback
 from app.windows.provider import DesktopScreenshotProvider, WindowScreenshotProvider
 from app.windows.recorder import DesktopRecorder, WindowRecorder
@@ -157,3 +160,29 @@ class WindowsServices:
         if isinstance(target, FullWindowsTarget):
             return DesktopRunGuard(self._observer_factory(), self._stop)
         return contextlib.nullcontext()
+
+    def bring_to_front(self, target: Target, *, activate: bool = False) -> bool:
+        """A run's window made seen (the person's decision of 2026-10-25): restored when minimised and raised to the
+        front -- with `activate` (the start of a run) also made the main window. Only the verified window, checked
+        again first; Full Windows has no window of its own. Sends no input. True when it was minimised or covered."""
+        if not isinstance(target, WindowTarget):
+            return False
+        self._verifier.recheck(target)
+        return self._backend.raise_window(target.hwnd, activate=activate)
+
+    def screen_rect(self, target: Target) -> tuple[int, int, int, int] | None:
+        """Where the target's picture lies on this computer's screen (left, top, width, height): a window's client
+        area, the whole desktop's layout -- for a picker that lays the picture exactly over it. Read only."""
+        if isinstance(target, FullWindowsTarget):
+            return tuple(target.layout)
+        if not isinstance(target, WindowTarget):
+            return None
+        self._verifier.recheck(target)
+        return self._backend.client_screen_rect(target.hwnd)
+
+    def escape_watch(self, entries) -> EscapeWatch | None:
+        """Esc anywhere stops a LIVE run (the person's decision of 2026-10-25): the watch for a batch, unless every
+        one of its targets is the whole desktop (Full Windows watches Esc, clicks and the mouse itself)."""
+        if all(entry.whole_screen for entry in entries):
+            return None
+        return EscapeWatch(self._observer_factory(), self._stop)

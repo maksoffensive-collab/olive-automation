@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Protocol, Sequence, runtime_checkable
 
 from app.core.cancel import EmergencyStop
 from app.playback.engine import PlaybackEngine
@@ -98,3 +98,17 @@ class AutomationServices(Protocol):
         """Entered around a whole LIVE run on that target (a script, waits included): whatever the provider needs to
         let the person take over -- an emergency stop on their own input, say. Raises when that cannot be set up,
         and then nothing runs. Most targets need nothing (`contextlib.nullcontext()`)."""
+
+    def bring_to_front(self, target: Target, *, activate: bool = False) -> bool:
+        """Make a run's target seen on this computer's screen (restored, raised; with `activate`, at the start of a
+        run, made the main window), so nothing covers what it shows or where it is clicked. Sends no input. True
+        when it was hidden or covered (it may need a moment to draw itself). Most targets need nothing (False)."""
+
+    def screen_rect(self, target: Target) -> tuple[int, int, int, int] | None:
+        """Where the target's picture lies on this computer's screen (left, top, width, height), or None when it is
+        not a place there (a device): a picker lays the picture exactly over the target. Read only."""
+
+    def escape_watch(self, entries: Sequence[TargetEntry]):
+        """An object with `start()` / `stop()` that, while started, turns the person's Esc anywhere into the
+        emergency stop -- for a LIVE run on the targets listed as `entries` -- or None when none is needed or
+        available. `start()` raises when the watch cannot be set up."""

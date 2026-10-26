@@ -39,6 +39,7 @@ from app.vision.bitmap import encode_png
 LABEL_WIDTH = 104                # the label column of a one-column (panel) form
 PICKER_MAX = (880, 480)          # the shown screenshot fits in this, so the picker fits a 1120 x 680 window's screen
 THUMB_MAX = (180, 70)
+NEAR_MISS = 0.9                  # a picture not found but this close: "test it now" says how low the confidence must be
 SEARCH_MARGIN = 20               # "search only around here": the template's place plus this many pixels each side
 DEFAULTS = {
     fe.PIXEL: {"x": "0", "y": "0", "color": "0, 0, 0", "tolerance": "0"},
@@ -533,13 +534,27 @@ class ConditionEditor:
             return
         center = result.center
         at = f"({center.x}, {center.y})" if center is not None else "—"
-        if result.observation.detail.get("confidence_measured", True) is False:
+        detail = result.observation.detail
+        closest = detail.get("best") if not (result.observation.found or result.satisfied) else None
+        threshold = detail.get("min_confidence")
+        if closest is not None:
+            # a picture that was not found: where it came closest, so a threshold can be set knowingly -- and, when
+            # it came near, the confidence at which it would have been found
+            scale = detail.get("scale", 1.0)
+            size = self.ui.t("probe_size").format(percent=round(scale * 100)) if scale != 1.0 else ""
+            if closest["confidence"] >= NEAR_MISS:
+                size += self.ui.t("probe_lower_to").format(value=fmt.confidence(self.ui, closest["confidence"], places=2))
+            self.lbl_result.configure(text=self.ui.t("probe_false_closest").format(
+                confidence=fmt.confidence(self.ui, closest["confidence"], threshold), size=size,
+                at=f"({closest['x'] + closest['width'] // 2}, {closest['y'] + closest['height'] // 2})"))
+            return
+        if detail.get("confidence_measured", True) is False:
             # no confidence was measured: say so, rather than show the reader's placeholder as a number
             key = "probe_true_unmeasured" if result.satisfied else "probe_false_unmeasured"
             self.lbl_result.configure(text=self.ui.t(key).format(at=at))
             return
         self.lbl_result.configure(text=self.ui.t("probe_true" if result.satisfied else "probe_false").format(
-            confidence=fmt.number(self.ui, result.confidence, 3), at=at))
+            confidence=fmt.confidence(self.ui, result.confidence, threshold), at=at))
 
 
 # ---- branches and recorded macros ---------------------------------------------------------------------------

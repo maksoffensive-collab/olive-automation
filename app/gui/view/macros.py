@@ -750,7 +750,10 @@ class MacrosScreen:
     def _read_preview(self, info) -> str:
         try:
             macro = self.c.library.load(info.path)
-            if hasattr(macro, "steps"):
+            if hasattr(macro, "nodes"):                # version 4: its blocks, in the order the arrows reach them
+                from app.gui.view.graph_editor import script_lines
+                rows = script_lines(self.ui, macro, self.c.macro_names())
+            elif hasattr(macro, "steps"):
                 rows = [fmt.step_line(self.ui, step) for step in macro.steps]
             else:
                 from app.gui.macro_edit import blocks_of, document_of
@@ -762,6 +765,9 @@ class MacrosScreen:
         lines = [f"{i + 1:02d}  {fmt.clip(row, PREVIEW_CHARS)}" for i, row in enumerate(rows[:PREVIEW_STEPS])]
         if len(rows) > PREVIEW_STEPS:
             lines.append(self.ui.t("details_more_steps").format(count=len(rows) - PREVIEW_STEPS))
+        places = getattr(getattr(macro, "recording", None), "places", ())
+        if places:                                 # a Full Windows recording: the windows its clicks go into
+            lines += fmt.places_lines(self.ui, places, PREVIEW_CHARS)
         return "\n".join(lines)
 
     def _runs_preview(self, info) -> str:
@@ -784,7 +790,8 @@ class MacrosScreen:
             lines = []
             for ref, title in zip(self.c.run_refs, titles):
                 entry = by_ref.get(ref)
-                lines.append(f"{title}  ·  {entry.group}" if entry is not None and entry.group else title)
+                group = fmt.group_label(self.ui, entry.group) if entry is not None and entry.group else ""
+                lines.append(f"{title}  ·  {group}" if group and group != title else title)
             shown = "\n".join(lines[:4])
             if len(lines) > 4:
                 shown += "\n" + self.ui.t("details_more_targets").format(count=len(lines) - 4)

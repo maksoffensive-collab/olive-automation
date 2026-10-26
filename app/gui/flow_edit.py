@@ -29,9 +29,9 @@ from app.decide import (ELSE, MAX_BLOCKS, MAX_NESTING, MAX_POSITION, MAX_START_D
                         ConditionalMacro, Decision, DecisionError, RunMacro, TapMatch, WaitUntil, count_blocks, walk)
 from app.decide.format import MacroFormatError, validate_macro
 from app.gui.macro_edit import UNDO_DEPTH, EditError
-from app.observe import (CONTAINS, EXACT, MAX_TEXT_LINES, ColorRegionQuery, InvalidQuery, PixelQuery, TemplateQuery,
-                         TextLine, TextLinesQuery, TextQuery, scaled_part)
-from app.providers.size import SizeChanged, fit
+from app.observe import (CONTAINS, EXACT, MAX_TEXT_LINES, QUERY_CODES, ColorRegionQuery, InvalidQuery, PixelQuery,
+                         TemplateQuery, TextLine, TextLinesQuery, TextQuery, check_picture, scaled_part)
+from app.providers.size import factors
 from app.playback.macro import ActionOp, Macro
 from app.providers.recording import Recording
 from app.vision.bitmap import Bitmap, VisionError
@@ -51,7 +51,11 @@ _PROBE_RECORDING = Recording("probe", "probe", ())       # only to ask the forma
 
 
 def _rejected(exc: BaseException) -> EditError:
-    """A refusal from a constructor or from the file format's own reader, in its own words."""
+    """A refusal from a constructor or from the file format's own reader, in its own words -- or, for a refusal of
+    a search a person can meet (QUERY_CODES), in theirs."""
+    code = getattr(exc, "code", "")
+    if code in QUERY_CODES:
+        return EditError(str(exc), f"err_query_{code}", **getattr(exc, "params", {}))
     return EditError(f"The value was not accepted: {exc}", "err_flow_rejected", reason=str(exc))
 
 
@@ -359,11 +363,11 @@ def set_adapt(document, adapt: bool):
 def fit_condition(document, condition, picked: dict):
     """`condition` in the script's own size, and the size the script has after it. `picked` says which parts of it
     (`PARTS`: the point, the area, the picture) were just picked, each on a picture of what size; only those are
-    scaled into the script's size (the same proportions) -- the others already are in it; parts the condition no
-    longer has (picked before its kind was changed) count for nothing. The first ones picked give the script its
-    size; other proportions are refused (the script's areas would not all be in one space), and so is a picture that
-    would be too small. A script that runs as is asks everything as it is stored, so a part picked on another size
-    is refused there: scaled it would be asked elsewhere, unscaled it would not be in the script's size."""
+    scaled into the script's size -- in any proportions, each direction by its own factor (a condition only looks;
+    decided on the person's report of 2026-10-25) -- the others already are in it; parts the condition no longer has
+    (picked before its kind was changed) count for nothing. The first ones picked give the script its size; a picture that
+    would be too small is refused. A script that runs as is asks everything as it is stored, so a part picked on
+    another size is refused there: scaled it would be asked elsewhere, unscaled it would not be in the script's size."""
     query = condition.query
     picked = {part: tuple(size) for part, size in (picked or {}).items() if size is not None and hasattr(query, part)}
     if not picked:
@@ -376,11 +380,7 @@ def fit_condition(document, condition, picked: dict):
             raise EditError(f"This script runs as is, at {own[0]}x{own[1]}; this was picked at {size[0]}x{size[1]}.",
                             "err_flow_as_is_other_size", made=f"{own[0]}x{own[1]}", now=f"{size[0]}x{size[1]}")
         try:
-            query = scaled_part(query, part, *fit(size, own), own[0], own[1])
-        except SizeChanged as exc:
-            raise EditError(f"Picked on a screen of other proportions than the script's other areas: {exc}",
-                            "err_flow_other_proportions", made=f"{own[0]}x{own[1]}",
-                            now=f"{size[0]}x{size[1]}") from None
+            query = scaled_part(query, part, *factors(size, own), own[0], own[1])
         except InvalidQuery as exc:
             raise EditError(str(exc), "err_flow_picture_too_small", made=f"{own[0]}x{own[1]}") from None
     return replace(condition, query=query), own
@@ -644,6 +644,11 @@ def build_condition(form: ConditionForm) -> Condition:
         elif form.kind == TEMPLATE:
             if form.template is None:
                 raise EditError("Capture a template from the screen first.", "err_flow_no_template")
+            try:
+                check_picture(form.template)
+            except InvalidQuery:
+                raise EditError("This picture is one flat colour, so it has no shape to be found by.",
+                                "err_flow_template_flat") from None
             query = TemplateQuery(form.template, parse_float(f.get("min_confidence", "0.95"), "field_min_confidence"),
                                   form.region, parse_int(f.get("max_results", "1"), "field_max_results"),
                                   form.expected, f.get("any_size", "0") == "1")

@@ -23,9 +23,10 @@ after the target is raised to the top of the Z order without being activated (`S
 is found there, the click is refused (`InputDeliveryError`) rather than ever sent to whatever else is on screen
 -- with a real click there is no safe way to address an occluded window at all. A KEY or character event needs
 the target to hold real system focus, not just be on screen, so the verified window is brought to the foreground
-first if it is not already (`SetForegroundWindow` -- the one API in this module that changes what has focus or
-is the foreground window, used only here, and re-checked immediately afterwards: refused, rather than ever sent
-to whatever else has focus, if Windows did not actually let it become the foreground window). This module never
+first if it is not already (`SetForegroundWindow`, re-checked immediately afterwards: refused, rather than ever
+sent to whatever else has focus, if Windows did not actually let it become the foreground window). The only other
+place that changes the foreground window is `raise_window` at the start of a run (the person's decision of
+2026-10-25: the run's window is made the main one), which sends nothing. This module never
 addresses input by moving the real pointer independently of a click or by targeting the "active"/"foreground"
 window as a blind fallback -- every real event is still computed from the SAME verified window's own geometry
 or handle, never a global one. The one exception presses nothing: letting go at the end of a live run
@@ -48,6 +49,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import os
 import queue
 import sys
 import threading
@@ -108,6 +110,10 @@ class Win32Backend(WindowBackend):
         self._IsWindowEnabled = sig(u.IsWindowEnabled, wintypes.BOOL, H)
         self._GetAncestor = sig(u.GetAncestor, H, H, wintypes.UINT)
         self._GetTextW = sig(u.GetWindowTextW, ctypes.c_int, H, wintypes.LPWSTR, ctypes.c_int)
+        try:
+            self._InternalText = sig(u.InternalGetWindowText, ctypes.c_int, H, wintypes.LPWSTR, ctypes.c_int)
+        except AttributeError:
+            self._InternalText = None
         self._GetClassW = sig(u.GetClassNameW, ctypes.c_int, H, wintypes.LPWSTR, ctypes.c_int)
         self._GetPid = sig(u.GetWindowThreadProcessId, wintypes.DWORD, H, ctypes.POINTER(wintypes.DWORD))
         self._GetRect = sig(u.GetWindowRect, wintypes.BOOL, H, ctypes.POINTER(wintypes.RECT))
@@ -224,15 +230,33 @@ class Win32Backend(WindowBackend):
         return (int(origin.x) - int(window_rect.left), int(origin.y) - int(window_rect.top),
                 max(0, int(rect.right - rect.left)), max(0, int(rect.bottom - rect.top)))
 
+    def client_screen_rect(self, hwnd: int) -> tuple[int, int, int, int] | None:
+        if not _valid_handle(hwnd):
+            return None
+        with self._dpi_aware():
+            if not self._IsWindow(hwnd):
+                return None
+            rect, origin = wintypes.RECT(), wintypes.POINT(0, 0)
+            if (not self._GetClientRectBase(hwnd, ctypes.byref(rect))
+                    or not self._ClientToScreenBase(hwnd, ctypes.byref(origin))):
+                return None
+            width, height = int(rect.right - rect.left), int(rect.bottom - rect.top)
+            return (int(origin.x), int(origin.y), width, height) if width > 0 and height > 0 else None
+
     def _info(self, hwnd: int) -> WindowInfo | None:
         if not self._IsWindow(hwnd):
             return None
-        title_buf = ctypes.create_unicode_buffer(_MAX_TITLE)
-        self._GetTextW(hwnd, title_buf, _MAX_TITLE)
-        class_buf = ctypes.create_unicode_buffer(256)
-        self._GetClassW(hwnd, class_buf, 256)
         pid = wintypes.DWORD(0)
         self._GetPid(hwnd, ctypes.byref(pid))
+        title_buf = ctypes.create_unicode_buffer(_MAX_TITLE)
+        if pid.value == os.getpid() and self._InternalText is not None:
+            # this process's own window: GetWindowTextW would SEND it WM_GETTEXT, waiting for this application's
+            # window thread -- from a playback thread, a stall; the window's own kept text needs no message
+            self._InternalText(hwnd, title_buf, _MAX_TITLE)
+        else:
+            self._GetTextW(hwnd, title_buf, _MAX_TITLE)
+        class_buf = ctypes.create_unicode_buffer(256)
+        self._GetClassW(hwnd, class_buf, 256)
         start, name = self._process_info(pid.value) if pid.value else (0, "")
         rect = wintypes.RECT()
         ok = self._GetRect(hwnd, ctypes.byref(rect))
@@ -414,6 +438,8 @@ def _own_input(extra_info: int) -> bool:
     return extra_info == _OWN_INPUT
 _SWP_NOSIZE, _SWP_NOMOVE, _SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
 _HWND_TOP = 0
+_SW_SHOWNOACTIVATE, _SW_RESTORE = 4, 9
+_SWP_ASYNCWINDOWPOS = 0x4000
 
 
 class _MOUSEINPUT(ctypes.Structure):
@@ -452,6 +478,13 @@ _REAL_CLICK_FLAGS: dict[MouseEvent, tuple[int, ...]] = {
 }
 
 
+class _Covered(InputDeliveryError):
+    """Another window is on top of the target at the point (`_resolve_real_click_target`)."""
+
+
+_RELEASES = frozenset({MouseEvent.LEFT_UP, MouseEvent.RIGHT_UP})
+
+
 def _valid_handle(hwnd: object) -> bool:
     return isinstance(hwnd, int) and not isinstance(hwnd, bool) and 0 < hwnd <= 0xFFFFFFFF
 
@@ -476,8 +509,8 @@ class Win32InputBackend(Win32Backend, WindowInputBackend):
     KEYBOARD: unlike a click, real key/character input is delivered to whichever window currently holds SYSTEM
     FOCUS, not to wherever it is on screen, so `_ensure_real_focus` brings the verified window to the foreground
     if it is not already the foreground window (or does not already own it) before every key or character send --
-    the one place this module calls an API that changes which window is the foreground/active window, gated
-    immediately afterwards by re-checking that it actually took effect: Windows itself restricts which process
+    gated immediately afterwards by re-checking that it actually took effect (the only other place that changes
+    the foreground window is `raise_window`, at the start of a run, sending nothing): Windows itself restricts which process
     can steal foreground focus, and if it did not work, the send is refused (`InputDeliveryError`) rather than
     ever going to whatever else currently has focus. Which SPECIFIC control within the foregrounded window ends
     up with keyboard focus is not, and cannot be, chosen here -- it follows the same real, OS-level focus a
@@ -505,6 +538,8 @@ class Win32InputBackend(Win32Backend, WindowInputBackend):
         self._GetForegroundWindow.restype = H
         self._SetForegroundWindow = u.SetForegroundWindow
         self._SetForegroundWindow.restype, self._SetForegroundWindow.argtypes = wintypes.BOOL, [H]
+        self._ShowWindowAsync = u.ShowWindowAsync
+        self._ShowWindowAsync.restype, self._ShowWindowAsync.argtypes = wintypes.BOOL, [H, ctypes.c_int]
         self._GetDoubleClickTime = u.GetDoubleClickTime
         self._GetDoubleClickTime.restype, self._GetDoubleClickTime.argtypes = wintypes.UINT, []
         self._clock = time.perf_counter                 # a fine clock (Python 3.12's monotonic moves in ~16 ms ticks)
@@ -519,6 +554,44 @@ class Win32InputBackend(Win32Backend, WindowInputBackend):
             if not self._IsWindow(hwnd) or not self._GetClientRect(hwnd, ctypes.byref(rect)):
                 return None
             return rect.right - rect.left, rect.bottom - rect.top
+
+    # ---- a run's window in front (the person's decision of 2026-10-25) -------------------------------------------
+    def raise_window(self, hwnd: int, *, activate: bool) -> bool:
+        """See `WindowInputBackend.raise_window`. The keyboard focus is taken only with `activate` -- at the start
+        of a run, when Olive itself holds it (the person has just pressed Run), so Windows lets it be passed on;
+        during a run the window is only raised, so a person typing in another program meanwhile keeps the focus
+        (and their keys never land in the target). Sends no input."""
+        if not _valid_handle(hwnd):
+            return False
+        with self._dpi_aware():
+            if not self._IsWindow(hwnd):
+                return False
+            hidden = bool(self._IsIconic(hwnd))
+            if hidden:
+                # restored as it was (a window minimised from maximised comes back maximised: [VERIFIED] 2026-10-25
+                # on Windows 11 with SW_SHOWNOACTIVATE too)
+                self._ShowWindowAsync(hwnd, _SW_RESTORE if activate else _SW_SHOWNOACTIVATE)
+            else:
+                hidden = self._covered(hwnd)
+            if activate:
+                foreground = self._GetForegroundWindow()
+                if foreground != hwnd and not (foreground and self._IsChild(hwnd, foreground)):
+                    self._SetForegroundWindow(hwnd)
+            # asynchronous: a program that is not responding must not hold Olive's window (or a run) waiting
+            self._SetWindowPos(hwnd, _HWND_TOP, 0, 0, 0, 0,
+                               _SWP_NOSIZE | _SWP_NOMOVE | _SWP_NOACTIVATE | _SWP_ASYNCWINDOWPOS)
+            return hidden
+
+    def _covered(self, hwnd: int) -> bool:
+        """Whether another window is over the middle of its client area (the system's own hit-test)."""
+        rect = wintypes.RECT()
+        if not self._GetClientRect(hwnd, ctypes.byref(rect)) or rect.right <= 0 or rect.bottom <= 0:
+            return False
+        point = wintypes.POINT(rect.right // 2, rect.bottom // 2)
+        if not self._ClientToScreenBase(hwnd, ctypes.byref(point)):
+            return False
+        hit = self._WindowFromPoint(point)
+        return not hit or (hit != hwnd and not self._IsChild(hwnd, hit))
 
     # ---- real click resolution and delivery (see class docstring) ---------------------------------------------
     def _resolve_real_click_target(self, top_hwnd: int, x: int, y: int) -> tuple[int, int, int]:
@@ -541,7 +614,7 @@ class Win32InputBackend(Win32Backend, WindowInputBackend):
         self._SetWindowPos(top_hwnd, _HWND_TOP, 0, 0, 0, 0, _SWP_NOSIZE | _SWP_NOMOVE | _SWP_NOACTIVATE)
         hit = self._WindowFromPoint(wintypes.POINT(screen_x, screen_y))
         if not hit or (hit != top_hwnd and not self._IsChild(top_hwnd, hit)):
-            raise InputDeliveryError("Another window currently covers the target at that point; nothing sent.")
+            raise _Covered("Another window currently covers the target at that point; nothing sent.")
         return hit, screen_x, screen_y
 
     def _ensure_real_focus(self, top_hwnd: int) -> None:
@@ -649,7 +722,15 @@ class Win32InputBackend(Win32Backend, WindowInputBackend):
             raise InputDeliveryError("Unknown pointer event; nothing sent.")
         if any(isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 0x7FFF for v in (x, y)):
             raise InputDeliveryError("Pointer coordinates out of the message range; nothing sent.")
-        _, screen_x, screen_y = self._resolve_real_click_target(hwnd, x, y)
+        try:
+            _, screen_x, screen_y = self._resolve_real_click_target(hwnd, x, y)
+        except _Covered:
+            if event not in _RELEASES:
+                raise
+            # A release presses nothing. A window the press itself opened over the point (a menu, a dialog) does not
+            # make the click a failure: the button is let go where the pointer already is -- no move, exactly as at
+            # the end of a run (`release_primary`). The person's decision of 2026-10-26 (docs/DECISION.md).
+            screen_x = screen_y = None
         self._send_real_click(screen_x, screen_y, event)
 
     def post_key(self, hwnd: int, event: KeyEvent, key: Key) -> None:
@@ -668,7 +749,8 @@ class Win32InputBackend(Win32Backend, WindowInputBackend):
     def post_char(self, hwnd: int, char: str) -> None:
         if not _valid_handle(hwnd):
             raise InputDeliveryError("Invalid window identifier; nothing sent.")
-        if not isinstance(char, str) or len(char) != 1 or not char.isprintable() or ord(char) > 0xFFFF                 or 0xD800 <= ord(char) <= 0xDFFF:
+        if not isinstance(char, str) or len(char) != 1 or not char.isprintable() or ord(char) > 0xFFFF \
+                or 0xD800 <= ord(char) <= 0xDFFF:
             raise InputDeliveryError("Only a single printable character from the basic multilingual plane can be "
                                      "sent; nothing sent.")
         self._ensure_real_focus(hwnd)
@@ -815,6 +897,7 @@ class Win32ObservationBackend(WindowObservationBackend):
 
     # ---- lifecycle -----------------------------------------------------------
     def start(self, hwnd: int | None, on_mouse, on_key, on_idle) -> None:
+        """`on_mouse` None: the keyboard only -- no mouse hook is put up at all (the Esc watch of a run)."""
         with self._lock:
             if self._active:
                 raise WindowCaptureError("Observation is already running.")
@@ -823,8 +906,8 @@ class Win32ObservationBackend(WindowObservationBackend):
             self._queue = queue.SimpleQueue()
             ready, failure = threading.Event(), []
             self._active = True
-            self._hook_thread = threading.Thread(target=self._run_hooks, args=(hwnd, ready, failure), daemon=True,
-                                                 name="observe-hooks")
+            self._hook_thread = threading.Thread(target=self._run_hooks, daemon=True, name="observe-hooks",
+                                                 args=(hwnd, ready, failure, on_mouse is not None))
             self._dispatch_thread = threading.Thread(target=self._run_dispatch, args=(on_mouse, on_key, on_idle),
                                                      daemon=True, name="observe-dispatch")
             self._hook_thread.start()
@@ -861,7 +944,7 @@ class Win32ObservationBackend(WindowObservationBackend):
         return clean
 
     # ---- hook thread -----------------------------------------------------------
-    def _run_hooks(self, hwnd: int | None, ready: threading.Event, failure: list) -> None:
+    def _run_hooks(self, hwnd: int | None, ready: threading.Event, failure: list, mouse: bool = True) -> None:
         if self._SetThreadDpi is not None:
             self._SetThreadDpi(ctypes.c_void_p(_DPI_PER_MONITOR_AWARE_V2))    # lives as long as this thread
         msg = wintypes.MSG()
@@ -892,9 +975,9 @@ class Win32ObservationBackend(WindowObservationBackend):
 
         self._mouse_proc, self._key_proc = self._hook_proc_type(mouse_proc), self._hook_proc_type(key_proc)
         module = self._GetModuleHandle(None)
-        mouse_hook = self._SetHook(_WH_MOUSE_LL, self._mouse_proc, module, 0)
+        mouse_hook = self._SetHook(_WH_MOUSE_LL, self._mouse_proc, module, 0) if mouse else None
         key_hook = self._SetHook(_WH_KEYBOARD_LL, self._key_proc, module, 0)
-        if not mouse_hook or not key_hook:
+        if (mouse and not mouse_hook) or not key_hook:
             failure.append("The operating system refused to install the input observation hooks.")
             for h in (mouse_hook, key_hook):
                 if h:
@@ -906,7 +989,8 @@ class Win32ObservationBackend(WindowObservationBackend):
             while self._GetMessage(ctypes.byref(msg), None, 0, 0) > 0:       # WM_QUIT (or an error) ends it
                 pass
         finally:
-            self._Unhook(mouse_hook)
+            if mouse_hook:
+                self._Unhook(mouse_hook)
             self._Unhook(key_hook)
 
     def _mouse_observation(self, hwnd: int | None, kind: MouseObservationKind, x: int, y: int,

@@ -60,7 +60,7 @@ from app.providers.target import Target, require_verified
 
 from .condition import ConditionResult, check_cancel, evaluate
 from .decision import Choice, Decision, RunMacro, TapMatch, count_blocks, decide, walk
-from .errors import Cancelled, DecisionError, InvalidDecision
+from .errors import ActionCancelled, ActionFailed, ActionRefused, Cancelled, DecisionError, InvalidDecision
 from .wait import WaitResult, WaitUntil, _sleep, wait_until
 
 MAX_STEPS = 100                     # steps of a script (its top level)
@@ -196,6 +196,25 @@ def act(macro: Macro, target: Target, create_playback: PlaybackFactory, *, stop:
     return engine.report()
 
 
+def perform(macro: Macro, target: Target, create_playback: PlaybackFactory, *, stop: EmergencyStop,
+            cancel: threading.Event | None = None, dry_run: bool = False,
+            allow_different_target: bool = False) -> ExecutionReport:
+    """`act`, and a macro that did not complete raised in this layer's own words: `ActionRefused` (nothing sent),
+    `ActionCancelled`, `ActionFailed`. The one road to playback for the runners that are not this module."""
+    try:
+        report = act(macro, target, create_playback, stop=stop, cancel=cancel, dry_run=dry_run,
+                     allow_different_target=allow_different_target)
+    except PlaybackRefused as exc:
+        raise ActionRefused(str(exc), exc.issues) from None
+    if report.state is PlaybackState.CANCELLED:
+        raise ActionCancelled(report.cancel_reason or "cancelled", report)
+    if report.state is not PlaybackState.COMPLETED:
+        failure = report.failure
+        raise ActionFailed(failure.message if failure else report.state.value, failure.code if failure else "",
+                           report)
+    return report
+
+
 class _Run:
     """One run's blocks, executed in order -- a chosen branch's blocks before the step after its IF."""
 
@@ -240,7 +259,11 @@ class _Run:
 
     def decision(self, decision: Decision, path: tuple) -> None:
         result = evaluate(decision.condition, self.context, cancel=self.cancel)
-        choice: Choice = decide(decision, result, scale=self.context.scale())
+        items = decision.then if result.satisfied else decision.otherwise
+        beside = bool(items) and isinstance(items[0], TapMatch) and items[0].offset != (0, 0)
+        # a click at a distance from the match needs the size it was set at in the same proportions (SizeChanged
+        # otherwise, nothing sent); a look, and a click on the match itself, follow any size
+        choice: Choice = decide(decision, result, scale=self.context.scale() if beside else (1.0, 1.0))
         rest = choice.items
         if choice.macro is None:
             self.done.append(StepReport(path[0], "decision", condition=result, branch=choice.branch, path=path))

@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import re
 import socket
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
 from app.core.cancel import EmergencyStop
-from app.core.errors import PlatformError, SafetyViolation
+from app.core.errors import EmergencyStopped, PlatformError, SafetyViolation
 from app.core.process import CommandResult, Runner
 from app.logging.structured import Logger
 
@@ -161,8 +162,17 @@ class AdbClient:
         self._log = logger
         self._port = server_port
         self._allow_start = allow_server_start
+        self._starting: threading.Thread | None = None      # a start in the background, while it runs
+        self._starting_lock = threading.Lock()
+        self._start_failure: str | None = None               # why the last background start failed, until said
 
     # ---- environment -------------------------------------------------
+    @property
+    def may_start_server(self) -> bool:
+        """Whether this client was created to start the ADB server when it is not running (the application's is:
+        controlling an instance needs it; the read-only tools' are not)."""
+        return self._allow_start
+
     def binary_found(self) -> bool:
         return self._path is not None and self._path.is_file()
 
@@ -235,6 +245,44 @@ class AdbClient:
         result = self._run(["start-server"], retry=False, operation="ADB_START_SERVER")
         if not result.ok:
             raise AdbError(f"Could not start the ADB server: {result.error or result.stderr_text.strip()}")
+
+    def start_server_soon(self) -> bool:
+        """Start the server on a thread of its own and return at once: where a person waits -- the window's thread,
+        which also carries the emergency stop -- a start (about 2 s) is never waited for. True when a start was begun
+        now, False when one is under way already. Gated like `start_server`; on its thread, a server that is running
+        already or an emergency stop means no start, and a failure is kept for `take_start_failure` (and logged when
+        this client has a logger), never raised."""
+        if not self._allow_start:
+            raise SafetyViolation("Starting the ADB server is not enabled for this client.")
+        with self._starting_lock:
+            if self._starting is not None and self._starting.is_alive():
+                return False
+            self._starting = threading.Thread(target=self._start_quietly, name="adb-server-start", daemon=True)
+            self._starting.start()
+            return True
+
+    def _start_quietly(self) -> None:
+        if self._stop.is_set() or self.server_running():
+            return
+        try:
+            self.start_server()
+        except EmergencyStopped:
+            return                                # the stop is no failure to report
+        except Exception as exc:                 # adb's own failure (a port taken, adb.exe missing): kept, not raised
+            self._start_failure = str(exc)[:300] or type(exc).__name__
+            if self._log:
+                self._log.warning("ADB_START_SERVER", result="FAILED", error=f"{type(exc).__name__}: {exc}"[:200])
+        else:
+            self._start_failure = None
+
+    def take_start_failure(self) -> str | None:
+        """Why the last background start failed -- said once, then forgotten, so the next choice tries again -- or
+        None (also while a start is under way)."""
+        with self._starting_lock:
+            if self._starting is not None and self._starting.is_alive():
+                return None
+            failure, self._start_failure = self._start_failure, None
+            return failure
 
     # ---- screenshot (read-only; requires a CaptureGrant) ---------------------
     def screencap_png(self, serial: str, *, grant: CaptureGrant) -> bytes:

@@ -197,9 +197,13 @@ class HistoryScreen:
             return
         shown = list(record.results) if self._showing_detail \
             else [r for r in record.results if r.outcome != store.COMPLETED][:RESULT_LINES]
-        lines = [self.ui.t("history_result_line").format(target=r.target,
-                                                         outcome=fmt.outcome_label(self.ui, r.outcome),
-                                                         done=r.completed, total=r.total) for r in shown]
+        lines = []
+        for r in shown:
+            lines.append(self.ui.t("history_result_line").format(target=r.target,
+                                                                 outcome=fmt.outcome_label(self.ui, r.outcome),
+                                                                 done=r.completed, total=r.total))
+            if r.outcome != store.COMPLETED:          # why it stopped, where, and what to do about it
+                lines.extend("    " + line for line in fmt.explain_lines(self.ui, r.detail))
         hidden = len(record.results) - len(shown)
         if lines and hidden > 0:
             lines.append(self.ui.t("details_more_targets").format(count=hidden))

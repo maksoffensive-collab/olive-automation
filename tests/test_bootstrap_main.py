@@ -162,7 +162,8 @@ class SelfCheck(unittest.TestCase):
 
     def test_a_fast_search_that_answers_wrongly_is_reported_but_does_not_fail_the_check(self):
         import app.vision.template as template
-        with patch.object(template, "fast_matcher", return_value=lambda *args: [(0, 0, 0)]):
+        wrong = template.TemplateSearch((template.TemplateMatch(0, 0, 3, 3, 1.0),), None)
+        with patch.object(template, "search_template", return_value=wrong):
             code, report, _ = self.run_check()
         self.assertEqual(code, 0)
         self.assertIn("wrong answer", report["checks"]["fast_picture_search"])

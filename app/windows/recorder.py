@@ -35,7 +35,14 @@ explicit target, so a GUI must call `start()`).
 The whole desktop ("Full Windows", on the person's explicit decision of 2026-10-19): `DesktopRecorder` records
 what the person does ANYWHERE on the screen except on this application's own windows -- mouse events in virtual-screen
 coordinates of the layout chosen (the same pixels as the Full Windows picture), keys while a window that is not this
-application's has the focus -- and ends as INVALID_TARGET if the screen layout changes while it records.
+application's has the focus -- and ends as INVALID_TARGET if the screen layout changes while it records. Each press
+and each release also keeps the window it landed in (the person's decision of 2026-10-25, item 12): the program, the
+window's class and title, its client size, whether it was already open when the recording started, a number that
+stays the same for that window while its title or size changes, and the point inside its client area
+(`app.providers.recording` "Places"). A move keeps only its screen point: a drag is played as moves from its press.
+No window is kept for one whose scale cannot be established (`WindowInfo.dpi_ambiguous`) or for this application's
+own. Read when the event is handled, a moment after the hook saw it [ASSUMPTION: the window under a press does not
+change in between].
 
 Input this application sends itself (marked; see app/windows/win32.py) is never recorded.
 
@@ -54,8 +61,8 @@ from app.core.cancel import EmergencyStop
 from app.core.errors import EmergencyStopped, PlatformError, TargetNotVerified
 from app.providers.base import TargetIdentity
 from app.providers.input import Key
-from app.providers.recording import (MAX_EVENTS, PointerButton, RecordedEventKind, RecorderState,
-                                     RecorderStateError, Recording, RecordingSession)
+from app.providers.recording import (MAX_EVENTS, UNKNOWN_PLACE, Place, PointerButton, RecordedEventKind,
+                                     RecorderState, RecorderStateError, Recording, RecordingSession, clean_place_text)
 from app.providers.target import Capability, require_capability
 from app.windows import keymap
 from app.windows.backend import (DESKTOP_HWND, DoubleClickSettings, KeyObservation, MouseObservation,
@@ -111,6 +118,11 @@ class WindowRecorder:
 
     def _focused(self, obs: KeyObservation) -> bool:
         return obs.foreground_hwnd == self._target.hwnd
+
+    def _place_in(self, obs: MouseObservation) -> tuple[int, int, int] | None:
+        """The window a pointer event happened in, when the recording keeps it (the whole desktop): None here -- a
+        window's own recording is in that window's coordinates already."""
+        return None
 
     def _reset_capture(self) -> None:
         self._held_buttons: dict[PointerButton, int] = {}       # button -> click_count of its recorded press
@@ -257,12 +269,13 @@ class WindowRecorder:
         size = self._size_of(obs)
         if size is not None:
             self._session.note_size(size)                # what a macro that adapts to the size scales from
+        place = self._place_in(obs)
         if kind is MouseObservationKind.MOVE:
             if self._last_move is not None:
                 last_t, lx, ly = self._last_move
                 if (lx, ly) == (x, y) or obs.t_ns - last_t < self._min_move_ns:
                     return
-            self._session.record(RecordedEventKind.POINTER_MOVE, x=x, y=y, at_ns=obs.t_ns)
+            self._session.record(RecordedEventKind.POINTER_MOVE, x=x, y=y, at_ns=obs.t_ns, place=place)
             self._last_move = (obs.t_ns, x, y)
         elif kind in _DOWN:
             button = _DOWN[kind]
@@ -273,13 +286,13 @@ class WindowRecorder:
                         and abs(x - px) <= self._double.dx // 2 and abs(y - py) <= self._double.dy // 2):
                     count = 2
             self._session.record(RecordedEventKind.BUTTON_DOWN, x=x, y=y, button=button, click_count=count,
-                                 at_ns=obs.t_ns)
+                                 at_ns=obs.t_ns, place=place)
             self._held_buttons[button] = count
             self._last_press = (button, obs.t_ns, x, y, count)
         else:
             button = _UP[kind]
             self._session.record(RecordedEventKind.BUTTON_UP, x=x, y=y, button=button,
-                                 click_count=self._held_buttons.pop(button), at_ns=obs.t_ns)
+                                 click_count=self._held_buttons.pop(button), at_ns=obs.t_ns, place=place)
 
     def _key(self, obs: KeyObservation) -> None:
         if self._session.state is not RecorderState.RECORDING or (obs.injected and self._ignore_injected) \
@@ -324,6 +337,17 @@ class DesktopRecorder(WindowRecorder):
         self._screen = screen
         self._own_pid = os.getpid() if own_pid is None else own_pid
         self._own_windows: set[int] = set()     # windows found to be ours: a click that closes one stays ours
+        self._open_at_start: set[int] = set()   # the windows there when the recording started
+        self._numbers: dict[int, int] = {}      # each window a press or release was in: its number, in order
+
+    def start(self) -> None:
+        if self._session.state is RecorderState.IDLE:     # (a refused second start changes nothing)
+            try:
+                self._open_at_start = {w.hwnd for w in self._screen.enumerate()}
+            except Exception:                    # not known: every window is then looked for when its click comes
+                self._open_at_start = set()
+            self._numbers = {}
+        super().start()
 
     @staticmethod
     def _accepts(target: object) -> bool:
@@ -357,6 +381,31 @@ class DesktopRecorder(WindowRecorder):
         """None: its points are the screen layout's (its target id), never scaled -- another layout is refused --
         so "Adapt to the size" is not offered for it."""
         return None
+
+    def _place_in(self, obs: MouseObservation) -> tuple[int, int, int] | None:
+        """A press or a release: the window under it, and the point inside its client area. A move: None (a drag is
+        played as moves from its press). A press in a window that cannot be described (none there, no program name,
+        no client area, a scale that cannot be established): marked UNKNOWN_PLACE -- a run of it is refused rather
+        than clicking its old screen point; a release there, or anything on this application's own: None."""
+        if obs.kind not in _DOWN and obs.kind not in _UP:
+            return None
+        unknown = (UNKNOWN_PLACE, 0, 0) if obs.kind in _DOWN else None
+        hwnd = obs.hit_hwnd
+        if hwnd is None:
+            return unknown
+        if self._ours(hwnd):
+            return None
+        info, rect = self._screen.query(hwnd), self._screen.client_screen_rect(hwnd)
+        if info is None or rect is None or not info.process_name or not info.class_name or info.dpi_ambiguous:
+            return unknown
+        left, top, width, height = rect
+        try:
+            place = Place(clean_place_text(info.process_name), clean_place_text(info.class_name),
+                          clean_place_text(info.title), width, height, hwnd in self._open_at_start,
+                          self._numbers.setdefault(hwnd, len(self._numbers)))
+        except ValueError:
+            return unknown
+        return self._session.place_of(place), obs.screen_x - left, obs.screen_y - top
 
     def _focused(self, obs: KeyObservation) -> bool:
         return obs.foreground_hwnd is not None and not self._ours(obs.foreground_hwnd)

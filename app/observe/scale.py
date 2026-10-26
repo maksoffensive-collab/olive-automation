@@ -1,6 +1,7 @@
 """A query made on a picture of one size, asked of a frame of another (the person's decision of 2026-10-20): its
-point, its area and its picture scaled by the factors `app.providers.size.fit` gives -- the same place, the same
-thing, at the new size. Kept inside the frame. Nothing else about the query changes. A picture is never made smaller
+point, its area and its picture scaled by the factors `app.providers.size.factors` gives -- each direction by its
+own, in any proportions (decided on the person's report of 2026-10-25: a look only looks) -- the same place, the
+same thing, at the new size. Kept inside the frame. Nothing else about the query changes. A picture is never made smaller
 than MIN_SIDE pixels a side (or than it was picked, when it was picked smaller): a few pixels match almost anywhere."""
 from __future__ import annotations
 
@@ -32,7 +33,8 @@ def _picture(picture: Bitmap, sx: float, sy: float, resize: Resize) -> Bitmap:
     w, h = max(1, round(picture.width * sx)), max(1, round(picture.height * sy))
     if too_small(picture, w, h):
         raise InvalidQuery(f"The {picture.width}x{picture.height} picture would be only {w}x{h} pixels at this size: "
-                           "too small to be told apart from anything else.")
+                           "too small to be told apart from anything else.", code="picture_too_small",
+                           picture=f"{picture.width}×{picture.height}", now=f"{w}×{h}")
     return resize(picture, w, h)
 
 

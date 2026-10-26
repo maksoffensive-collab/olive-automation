@@ -346,7 +346,7 @@ class Library(gui_tests.Base):
 
 class TargetsBelongToTheirMacro(Library):
     def test_returning_to_a_macro_brings_back_its_own_targets_never_another_macros(self):
-        first, second = self.saved("First"), self.saved("Second")
+        first, second = self.saved("First"), self.copied_in("Second")
         notes, calculator = self.entry("Notes").ref, self.entry("Calculator").ref
         self.c.select_macro(first)
         self.c.set_run_refs([notes])
@@ -359,20 +359,30 @@ class TargetsBelongToTheirMacro(Library):
         self.c.select_macro(second)
         self.assertEqual(self.c.run_refs, (calculator,))
 
-    def test_a_macro_replaced_by_a_new_recording_must_have_its_targets_chosen_again(self):
+    def test_a_macro_that_remembers_its_own_target_never_takes_another_macros(self):
+        """Item 12: each recorded macro has the target IT was recorded on, whatever was chosen for another."""
+        first, second = self.saved("First"), self.saved("Second")             # both recorded on Notes
+        self.c.select_macro(first)
+        self.c.set_run_refs([self.entry("Calculator").ref])                    # First now runs on Calculator
+        self.c.select_macro(second)
+        self.assertEqual(self.c.run_refs, (self.entry("Notes").ref,))         # Second keeps its own
+        self.c.select_macro(first)
+        self.assertEqual(self.c.run_refs, (self.entry("Calculator").ref,))
+
+    def test_a_macro_replaced_by_a_new_recording_has_the_target_it_was_recorded_on(self):
+        """Item 12: a recording remembers the target it was recorded on -- never the targets chosen for what the
+        file held before."""
         key = self.saved("Farm")
         self.c.select_macro(key)
-        self.c.set_run_refs([self.entry("Notes").ref])
-        self.record(clicks=2)                                          # a different recording ...
+        self.c.set_run_refs([self.entry("Calculator").ref])            # chosen for the old one
+        self.record(clicks=2)                                          # a different recording, on Notes ...
         self.assertTrue(self.c.save("Farm", overwrite=True), self.c.status)     # ... saved over the old one
-        self.assertEqual(self.c.status.key, "msg_saved_targets_cleared")
-        self.assertEqual(self.c.run_refs, ())
         self.c.select_macro(key)
-        self.assertEqual(self.c.run_refs, ())                         # and not brought back either
-        self.assertFalse(self.c.can_run())
-        self.assertEqual(self.c.suggested_run_refs(), (self.entry("Notes").ref,))   # only offered, to confirm
+        self.assertEqual(self.c.run_refs, (self.entry("Notes").ref,))  # its own target, not Calculator
+        self.assertTrue(self.c.can_run())
 
-    def test_a_macro_changed_in_the_editor_loses_its_targets_an_untouched_save_keeps_them(self):
+    def test_a_macro_changed_in_the_editor_keeps_the_target_it_remembers(self):
+        """The person's list of 2026-10-25, item 12 (before: the targets were cleared and asked for again)."""
         key = self.saved("Farm")
         self.c.select_macro(key)
         self.c.set_run_refs([self.entry("Notes").ref])
@@ -381,8 +391,8 @@ class TargetsBelongToTheirMacro(Library):
         self.assertEqual(self.c.run_refs, (self.entry("Notes").ref,))
         self.c.editor_apply(macro_edit.set_point, 0, 12, 34)
         self.assertTrue(self.c.save_editor(), self.c.status)
-        self.assertEqual(self.c.status.key, "msg_saved_targets_cleared")
-        self.assertEqual(self.c.run_refs, ())
+        self.assertEqual(self.c.status.key, "msg_saved")
+        self.assertEqual(self.c.run_refs, (self.entry("Notes").ref,))  # remembered, found again
 
     def test_saving_an_edited_copy_never_overwrites_the_file_it_was_copied_from(self):
         key = self.saved("Farm")
@@ -466,6 +476,32 @@ class TargetsBelongToTheirMacro(Library):
         self.c.select_macro(key)
         self.assertEqual(self.c.run_refs, ())
         self.assertFalse(self.c.can_run())
+
+    def test_a_file_replaced_outside_then_changed_in_the_editor_does_not_get_the_old_target_back(self):
+        """The independent review of 2026-10-26: saving re-stamps a remembered target only when it was remembered
+        for the very version the editor opened."""
+        key, _, _ = self.replaced_outside("Mine", "Theirs")
+        self.assertTrue(self.c.open_editor(key))
+        self.c.editor_apply(macro_edit.set_point, 0, 12, 34)
+        self.assertTrue(self.c.save_editor(), self.c.status)
+        self.assertEqual(self.c.run_refs, ())
+        self.c.select_macro(key)
+        self.assertEqual(self.c.run_refs, ())
+        self.assertFalse(self.c.can_run())
+
+    def test_a_macro_that_remembers_nothing_has_its_targets_cleared_when_changed(self):
+        """What was asserted before item 12 still holds where nothing is remembered: a macro changed in the
+        editor does not keep the targets chosen in this session for what it did before."""
+        key = self.copied_in("Farm")
+        self.c.select_macro(key)
+        self.c.set_run_refs([self.entry("Notes").ref])
+        self.c.meta.set_target(key, None)                                  # nothing remembered for it
+        self.assertTrue(self.c.open_editor(key))
+        self.c.editor_apply(macro_edit.set_point, 0, 12, 34)
+        self.assertTrue(self.c.save_editor(), self.c.status)
+        self.assertEqual(self.c.status.key, "msg_saved_targets_cleared")
+        self.assertEqual(self.c.run_refs, ())
+        self.assertEqual(self.c.suggested_run_refs(), (self.entry("Notes").ref,))   # only offered, to confirm
 
     def test_a_refresh_never_suggests_a_token_that_now_names_another_window(self):
         first, second = self.saved("First"), self.saved("Second")
@@ -582,14 +618,12 @@ class TargetsBelongToTheirMacro(Library):
     def test_a_new_macro_saved_under_the_name_of_a_deleted_one_never_inherits_its_targets(self):
         key = self.saved("Farm")
         self.c.select_macro(key)
-        self.c.set_run_refs([self.entry("Notes").ref])
+        self.c.set_run_refs([self.entry("Calculator").ref])
         (self.library.directory / key).unlink()                       # deleted in the file manager
-        self.record(clicks=2)
+        self.record(clicks=2)                                          # recorded on Notes
         self.assertTrue(self.c.save("Farm"), self.c.status)           # a new file under the same name
-        self.assertEqual(self.c.status.key, "msg_saved_targets_cleared")
         self.c.select_macro(key)
-        self.assertEqual(self.c.run_refs, ())
-        self.assertFalse(self.c.can_run())
+        self.assertEqual(self.c.run_refs, (self.entry("Notes").ref,))  # its own target, never Calculator
 
     def test_saving_the_same_recording_over_itself_keeps_its_targets(self):
         key = self.saved("Farm")
@@ -602,23 +636,30 @@ class TargetsBelongToTheirMacro(Library):
 
 
 class NewScript(gui_tests.Base):
-    def v2_files(self):
-        return [i for i in self.library.list() if i.version == 2]
+    """A new script is a version-4 drawing (the person's design of 2026-10-25); the rules of 2026-10-19 stay: nothing
+    is written until it has a block and is saved, a name is required, a name taken meanwhile is never written over
+    and the work is kept."""
 
-    def test_a_new_script_writes_nothing_until_it_has_a_step_and_is_saved(self):
+    def v4_files(self):
+        return [i for i in self.library.list() if i.version == 4]
+
+    def a_block(self):
+        from app.gui import graph_edit as ge
+        return self.c.editor_apply_graph(ge.add_node, "wait", (0, 120))
+
+    def test_a_new_script_writes_nothing_until_it_has_a_block_and_is_saved(self):
         self.assertTrue(self.c.new_script("Daily"), self.c.status)
-        self.assertTrue(self.c.editing_new and self.c.editing_v2)
+        self.assertTrue(self.c.editing_new and self.c.editing_graph)
         self.assertFalse(self.c.editor_dirty)
-        self.assertEqual(self.v2_files(), [])
-        self.assertFalse(self.c.save_editor())                         # empty: refused, in words
+        self.assertEqual(self.v4_files(), [])
+        self.assertFalse(self.c.save_editor())                         # only its start: refused, in words
         self.assertEqual(self.c.status.key, "err_script_empty")
-        self.assertEqual(self.v2_files(), [])
-        step = RunMacro(recorded())
-        self.assertTrue(self.c.editor_apply(fe.insert_step, 0, step))
+        self.assertEqual(self.v4_files(), [])
+        self.assertEqual(self.a_block(), "wait1")
         self.assertTrue(self.c.save_editor(), self.c.status)
-        files = self.v2_files()
+        files = self.v4_files()
         self.assertEqual([i.name for i in files], ["Daily"])
-        self.assertEqual(self.library.load(files[0].path).steps, (step,))   # what was saved is what reopens
+        self.assertEqual(self.library.load(files[0].path), self.c.editor.document)   # what was saved reopens
         self.assertFalse(self.c.editing_new)
         self.assertEqual(self.c.selected_key, files[0].key)
 
@@ -632,8 +673,7 @@ class NewScript(gui_tests.Base):
 
     def test_a_name_taken_while_the_script_was_built_is_replaced_and_the_work_is_kept(self):
         self.assertTrue(self.c.new_script("Daily"), self.c.status)
-        step = RunMacro(recorded())
-        self.assertTrue(self.c.editor_apply(fe.insert_step, 0, step))
+        self.a_block()
         taken = self.library.save(flow("Daily"))                      # meanwhile: a file under that name
         before = taken.read_bytes()
         self.assertFalse(self.c.save_editor())                        # never written over ...
@@ -646,14 +686,14 @@ class NewScript(gui_tests.Base):
         self.assertTrue(self.c.save_editor(), self.c.status)
         self.assertEqual(taken.read_bytes(), before)
         saved = self.library.load(self.library.path_for("Daily 2"))
-        self.assertEqual((saved.name, saved.steps), ("Daily 2", (step,)))
+        self.assertEqual((saved.name, [n.id for n in saved.nodes]), ("Daily 2", ["start", "wait1"]))
         self.assertTrue(self.c.editor_undo())
         self.assertEqual(self.c.editor.document.name, "Daily 2")     # undo never brings the taken name back
 
     def test_an_untouched_new_script_leaves_nothing_behind_and_a_name_is_required(self):
         self.c.new_script("Nothing")
         self.c.close_editor()
-        self.assertEqual(self.v2_files(), [])
+        self.assertEqual(self.v4_files(), [])
         self.assertFalse(self.c.new_script("   "))
         self.assertEqual(self.c.status.key, "err_script_name")
 
@@ -989,6 +1029,31 @@ class LargeWindow(Window):
 
 
 class Shell(Window):
+    def test_the_wheel_over_a_drop_down_list_never_changes_its_choice(self):
+        """The person's report of 2026-10-25: scrolling the properties panel with the wheel switched a condition from
+        "Picture" to "Pixel colour" -- Tk's drop-down list takes the wheel to step through its values. In Olive the
+        wheel over a list scrolls what holds it and never changes the choice."""
+        from tkinter import ttk
+        from app.gui.view import widgets as w
+        holder = tk.Toplevel(self.root)
+        holder.withdraw()
+        self.addCleanup(holder.destroy)
+        outer, inner = w.scroll_area(self.app, holder)
+        outer.pack()
+        scrolled = []
+        canvas = outer.winfo_children()[0]
+        canvas.yview_scroll = lambda *args: scrolled.append(args)          # what the panel's own wheel does
+        choice = tk.StringVar(value="Picture")
+        box = ttk.Combobox(inner, textvariable=choice, values=["Pixel colour", "Picture", "Text"], state="readonly")
+        box.pack()
+        self.root.update()
+        canvas.event_generate("<Leave>", when="now")                       # the pointer went on into the list
+        for delta in (120, -120, -120):
+            box.event_generate("<MouseWheel>", delta=delta, when="now")
+            self.root.update()
+            self.assertEqual(choice.get(), "Picture")
+        self.assertEqual(len(scrolled), 3)                                 # the panel scrolled instead
+
     def test_the_header_names_the_page_and_says_what_it_is_for_or_where_you_are(self):
         self.app.show_screen("scripts")
         self.assertEqual(self.app.lbl_title.cget("text"), self.app.t("nav_scripts"))
@@ -1104,39 +1169,6 @@ class NothingIsCutOff(Window):
 
 
 class ScriptEditor(Window):
-    def new_script(self):
-        self.stub_dialog("NewScript", ("Daily", ""))
-        self.app.show_screen("scripts")
-        self.app.screens["scripts"]._new_script()
-        self.assertEqual(self.app.screen, "editor")
-        self.app.render()
-
-    def test_new_script_opens_an_empty_editor_and_saving_waits_for_the_first_block(self):
-        self.new_script()
-        self.assertEqual(self.editor.lbl_state.cget("text"), self.app.t("editor_new_empty"))
-        self.assertIn("disabled", self.editor.btn_save.state())
-        roles = {b.role for b in self.editor.canvas_view.layout.boxes}
-        self.assertIn(fl.PLACEHOLDER, roles)
-        self.editor._add_step(fe.RUN)
-        self.assertIn(fl.PENDING, {b.role for b in self.editor.canvas_view.layout.boxes})
-        step = RunMacro(recorded(name="Inner"))
-        self.editor.form.build = lambda: step
-        self.assertTrue(self.editor.apply_form(), self.c.status)
-        self.app.render()
-        self.assertNotIn("disabled", self.editor.btn_save.state())
-        self.app._key_save()
-        saved = [i for i in self.library.list() if i.version == 2]
-        self.assertEqual([i.name for i in saved], ["Daily"])
-        self.assertEqual(self.library.load(saved[0].path).steps, (step,))
-
-    def test_a_block_that_cannot_be_built_is_marked_and_explained_and_nothing_is_added(self):
-        self.new_script()
-        self.editor._add_step(fe.RUN)                                  # no recorded macro exists to choose
-        self.assertFalse(self.editor.apply_form())
-        self.assertTrue(self.editor.lbl_form_error.cget("text"))
-        self.assertTrue(self.editor.canvas_view.scene.pending_invalid)
-        self.assertEqual(self.c.editor.document.steps, ())
-
     def test_choosing_a_block_on_the_canvas_chooses_it_in_the_list_and_the_panel(self):
         key = self.library.key_of(self.library.save(flow("Collect")))
         self.c.refresh_macros()
@@ -1207,39 +1239,6 @@ class ScriptEditor(Window):
         self.assertEqual(self.editor.tree.get_children("h:1/then"), ("s:1/then/0",))
         self.editor.set_view("canvas")
         self.assertTrue(self.editor.canvas_view.frame.winfo_manager())
-
-    def built_but_taken(self):
-        """A new script with a step, whose name a file made meanwhile has taken."""
-        self.new_script()
-        step = RunMacro(recorded(name="Inner"))
-        self.assertTrue(self.c.editor_apply(fe.insert_step, 0, step))
-        taken = self.library.save(flow("Daily"))
-        return step, taken, taken.read_bytes()
-
-    def test_saving_under_a_name_taken_meanwhile_asks_for_another_and_keeps_the_work(self):
-        step, taken, before = self.built_but_taken()
-        self.stub_dialog("TextPrompt", "Daily 2")
-        self.editor.save()
-        self.assertEqual(taken.read_bytes(), before)
-        self.assertFalse(self.c.editing_new)
-        saved = self.library.load(self.library.path_for("Daily 2"))
-        self.assertEqual((saved.name, saved.steps), ("Daily 2", (step,)))
-
-    def test_declining_another_name_keeps_the_new_script_open_and_unsaved(self):
-        _, taken, before = self.built_but_taken()
-        self.stub_dialog("TextPrompt", None)
-        self.editor.save()
-        self.assertTrue(self.c.editing_new and self.c.editor_dirty)
-        self.assertEqual(self.c.status.category, "exists")
-        self.assertEqual(taken.read_bytes(), before)
-
-    def test_leaving_with_save_asks_for_a_free_name_too(self):
-        self.built_but_taken()
-        self.stub_dialog("UnsavedChanges", "save")
-        self.stub_dialog("TextPrompt", "Daily 2")
-        self.editor.go_back()
-        self.assertIsNone(self.c.editor)
-        self.assertTrue(self.library.path_for("Daily 2").exists())
 
     def test_saving_over_a_version_saved_outside_meanwhile_asks_first(self):
         path = self.library.save(flow("Collect"))

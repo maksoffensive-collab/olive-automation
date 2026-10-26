@@ -633,7 +633,7 @@ class ScreenshotReuse(unittest.TestCase):
         results = ctx.observe_all([
             PixelQuery((30, 20), RED),
             ColorRegionQuery(RED, region=Roi(25, 15, 20, 20), min_ratio=0.2),
-            TemplateQuery(Bitmap.solid(4, 4, RED), min_confidence=0.99, region=Roi(28, 18, 14, 14)),
+            TemplateQuery(scene().crop(28, 18, 6, 6), min_confidence=0.99, region=Roi(28, 18, 14, 14)),
             TextQuery("Collect"),
         ])
         self.assertEqual(provider.captures, 1, "observe_all captured more than once")

@@ -17,13 +17,14 @@ from app.windows.target import FullWindowsTarget, is_desktop_id
 from tests.test_gui import OWN_PID, World as WinWorld
 from tests.test_ldplayer_services import rig as ld_rig
 from tests.test_mapping import Inst, World as LDWorld
+from tests.test_recorder import FakeObserver
 from tests.test_windows_provider import info
 
 
 def windows_services(stop: EmergencyStop) -> WindowsServices:
     world = WinWorld(info(hwnd=100, title="Notes", name="notes.exe", cls="NotesWnd", pid=10),
                      info(hwnd=102, title="Automation Platform", name="python.exe", cls="TkTopLevel", pid=OWN_PID))
-    return WindowsServices(world, lambda: None, stop, own_pid=OWN_PID)
+    return WindowsServices(world, FakeObserver, stop, own_pid=OWN_PID)     # a fresh observer per watch, as for real
 
 
 def two_provider_composite(*, ld_world: LDWorld | None = None) -> tuple[CompositeAutomationServices, EmergencyStop]:

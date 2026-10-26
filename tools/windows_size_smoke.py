@@ -7,7 +7,8 @@ the client area (`MARKER`).
      (other proportions) it is refused before anything is sent; minimised (no size to read), refused too.
   2. A script made at 300 x 200 -- a picture of the rectangle cut from a REAL screenshot, as the editor's picker cuts
      it, looked for in an area around it, and a click beside it: a dry run sends nothing; at 450 x 300 it finds the
-     rectangle and clicks beside it at 1.5 times the offset; at 600 x 200 it is refused before it does anything.
+     rectangle and clicks beside it at 1.5 times the offset; at 600 x 200 it is refused before it clicks (a click
+     beside a match needs the same proportions; since 2026-10-25 a look alone follows any proportions).
   3. "In any size" (needs the optional fast search, OpenCV): the same picture in a script that runs as is, found
      at 450 x 300 at 150 %, and clicked in its middle.
 

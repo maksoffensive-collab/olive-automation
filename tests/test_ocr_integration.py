@@ -405,6 +405,95 @@ class ProbeAndEditor(Base):
         # (tests.test_text_screen) set it
         self.assertIsInstance(runner.reads[0][2], threading.Event)
 
+    def test_a_picture_that_is_not_found_says_where_it_came_closest(self):
+        """2026-10-21: a picture condition that is false says how close the nearest place came (and at what size, in
+        any size), so a threshold can be set knowingly; a condition that holds is said as before."""
+        from types import SimpleNamespace
+        from unittest import mock
+        from app.gui.view import fmt
+        app = self.app(None)
+        editor = self.dialog(app).condition
+        best = {"confidence": 0.8712, "x": 10, "y": 20, "width": 8, "height": 6}
+
+        def result(satisfied, scale):
+            observation = SimpleNamespace(found=False, detail={"best": best, "scale": scale, "count": 0})
+            return SimpleNamespace(observation=observation, satisfied=satisfied, center=None, confidence=0.0)
+        for scale, size in ((1.0, ""), (1.35, app.t("probe_size").format(percent=135))):
+            with mock.patch.object(app.controller, "finish_probe", return_value=result(False, scale)):
+                editor._tested(None, None)
+            self.assertEqual(editor.lbl_result.cget("text"), app.t("probe_false_closest").format(
+                confidence=fmt.number(app, 0.8712, 3), at="(14, 23)", size=size))
+        with mock.patch.object(app.controller, "finish_probe", return_value=result(True, 1.0)):   # "is not there"
+            editor._tested(None, None)
+        self.assertEqual(editor.lbl_result.cget("text"),
+                         app.t("probe_true").format(confidence=fmt.number(app, 0.0, 3), at="—"))
+
+    def test_a_confidence_is_never_shown_as_reaching_a_threshold_it_did_not_reach(self):
+        """The person's report of 2026-10-25: at a confidence of 1 (or 0.XXXX) "test it now" said "False now ·
+        closest: confidence 1": 0.99984 was rounded to 3 places. The number shown is cut, never rounded up, with as
+        many places as it takes to be on the same side of the threshold as the real value; a near miss says how low
+        the confidence would have to be."""
+        from types import SimpleNamespace
+        from unittest import mock
+        app = self.app(None)
+        app.apply_language("ru")
+        editor = self.dialog(app).condition
+
+        def result(satisfied, conf, threshold):
+            best = {"confidence": conf, "x": 10, "y": 20, "width": 8, "height": 6}
+            detail = {"best": best, "scale": 1.0, "count": int(satisfied), "min_confidence": threshold}
+            observation = SimpleNamespace(found=satisfied, detail=detail)
+            return SimpleNamespace(observation=observation, satisfied=satisfied, center=None, confidence=conf)
+        for conf, threshold, shown in ((0.99984, 1.0, "0,999"), (0.95549, 0.9555, "0,9554"),
+                                       (0.9554999, 0.95549999, "0,9554999")):
+            with mock.patch.object(app.controller, "finish_probe", return_value=result(False, conf, threshold)):
+                editor._tested(None, None)
+            text = editor.lbl_result.cget("text")
+            self.assertIn(f"уверенность {shown} ", text)
+        with mock.patch.object(app.controller, "finish_probe", return_value=result(False, 0.99984, 1.0)):
+            editor._tested(None, None)
+        self.assertIn(app.t("probe_lower_to").format(value="0,99"), editor.lbl_result.cget("text"))
+        with mock.patch.object(app.controller, "finish_probe", return_value=result(False, 0.89, 0.95)):
+            editor._tested(None, None)                                   # not near: no hint at all
+        self.assertNotIn(app.t("probe_lower_to").split("{")[0], editor.lbl_result.cget("text"))
+        # found: never shown below the threshold it passed either
+        with mock.patch.object(app.controller, "finish_probe", return_value=result(True, 0.95551, 0.9555)):
+            editor._tested(None, None)
+        self.assertIn("уверенность 0,9555 ", editor.lbl_result.cget("text"))
+        with mock.patch.object(app.controller, "finish_probe", return_value=result(True, 1.0, 1.0)):
+            editor._tested(None, None)
+        self.assertIn("уверенность 1 ", editor.lbl_result.cget("text"))
+
+    def test_a_picture_larger_than_its_area_is_refused_in_the_persons_language(self):
+        """2026-10-25: "test it now" said "The 300x200 template does not fit in the 200x150 search region."."""
+        from app.vision.bitmap import Bitmap
+        from app.vision.roi import Roi
+        app = self.app(None)
+        app.apply_language("ru")
+        editor = self.dialog(app).condition
+        editor.kind_var.set(app.t("cond_template"))
+        editor._on_kind()
+        editor.template = Bitmap(30, 20, bytes((x * 7 + y * 13 + c * 50) % 256 for y in range(20) for x in range(30)
+                                               for c in range(3)))
+        editor.region = Roi(0, 0, 12, 10)
+        editor._test()
+        app._drain_jobs()
+        self.assertEqual(editor.lbl_result.cget("text"), app.t("err_query_picture_larger_than_area").format(
+            picture="30×20", area="12×10"))
+        self.assertIn("Картинка (30×20) больше области поиска (12×10)", editor.lbl_result.cget("text"))
+
+    def test_the_confidence_format_cuts_and_keeps_the_side_of_the_threshold(self):
+        from app.gui.view import fmt
+        app = self.app(None)
+        self.assertEqual(fmt.confidence(app, 1.0), "1")
+        self.assertEqual(fmt.confidence(app, 0.99996), "0.999")
+        self.assertEqual(fmt.confidence(app, 0.99996, 1.0), "0.999")
+        self.assertEqual(fmt.confidence(app, 0.95, 0.95), "0.95")
+        self.assertEqual(fmt.confidence(app, 0.949999, 0.95), "0.949")
+        self.assertEqual(fmt.confidence(app, 0.8712), "0.871")
+        self.assertEqual(fmt.confidence(app, 0.0), "0")
+        self.assertEqual(fmt.confidence(app, 0.123456789, 0.123456789), "0.123456789")
+
     def test_a_probe_that_failed_for_its_own_reason_says_that_reason_even_under_the_stop(self):
         """The answer arrives after the stop: the status bar keeps saying the stop, but the dialog that asked shows
         why THIS probe failed -- it did not fail because of the stop."""

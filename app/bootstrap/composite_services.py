@@ -121,3 +121,18 @@ class CompositeAutomationServices:
 
     def guard_run(self, target: Target):
         return self._service_for(target.provider_id).guard_run(target)
+
+    def bring_to_front(self, target: Target, *, activate: bool = False) -> bool:
+        return self._service_for(target.provider_id).bring_to_front(target, activate=activate)
+
+    def screen_rect(self, target: Target):
+        return self._service_for(target.provider_id).screen_rect(target)
+
+    def escape_watch(self, entries):
+        """The first provider that watches the keyboard (whatever provider the targets are from: Esc is the
+        person's, wherever it is pressed)."""
+        for service in self._services:
+            watch = service.escape_watch(entries)
+            if watch is not None:
+                return watch
+        return None

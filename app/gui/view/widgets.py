@@ -290,11 +290,22 @@ def scroll_area(ui, parent: tk.Widget, *, background: Callable[[], str] | None =
 
     inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
     canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
-    canvas.bind("<Enter>", lambda _e: canvas.bind_all(
-        "<MouseWheel>", lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")))
-    canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+    canvas.olive_scrolls = True                   # the wheel anywhere over it (its fields included) scrolls it
+    canvas.bind_all("<MouseWheel>", _route_wheel)
     ui.on_theme(lambda: canvas.configure(background=colour()))
     return outer, inner
+
+
+def _route_wheel(event) -> None:
+    """The wheel scrolls the scroll area under the pointer: the one that holds the widget the wheel turned over (Tk
+    sends it to the widget under the pointer). Entering a field inside an area is, for Tk, leaving the area, so an
+    area's own Enter / Leave could not tell; nothing here changes a field's value (app.App: lists ignore the wheel)."""
+    widget = event.widget
+    while isinstance(widget, tk.Misc):
+        if getattr(widget, "olive_scrolls", False):
+            widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return
+        widget = widget.master
 
 
 def _flat_style(colour: str) -> str:

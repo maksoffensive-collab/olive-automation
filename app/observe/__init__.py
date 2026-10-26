@@ -19,14 +19,15 @@ it; which implementation answers is chosen at the composition root, exactly as t
     context.py    one target's screen: capture, reuse, bounded and cancellable waiting.
 """
 from .context import DEFAULT_INTERVAL_S, MAX_TIMEOUT_S, ObservationContext
-from .errors import (InvalidQuery, ObservationCancelled, ObservationError, ObservationTimeout,
+from .errors import (QUERY_CODES, InvalidQuery, ObservationCancelled, ObservationError, ObservationTimeout,
                      ObservationUnavailable, OcrLanguageUnavailable, OcrUnavailable)
 # `OcrProvider` is part of this package's own API: it is the type of the text reader an `ObservationContext` is
 # given, and `OcrResult` is what `read_text` answers. Re-exported so a caller that only hands a reader through or
 # shows what it read (the GUI) can name those types without importing the OCR package itself -- it still depends
 # on the OCR CONTRACT through this API (never on an engine), and says so.
 from app.ocr.provider import OcrProvider, OcrResult
-from .observer import applies_text_confidence, check_text_reader, observe, read_text, reader_languages
+from .observer import (applies_text_confidence, check_picture, check_text_reader, observe, read_text,
+                       reader_languages)
 from .query import (CONTAINS, EXACT, MAX_TEXT_LINES, ColorRegionQuery, PixelQuery, Query, TemplateQuery, TextLine,
                     TextLinesQuery, TextQuery)
 from .result import COLOR_REGION, KINDS, PIXEL, TEMPLATE, TEXT, TEXT_LINES, Match, ObservationResult
@@ -38,8 +39,10 @@ __all__ = [
     "PixelQuery", "ColorRegionQuery", "TemplateQuery", "TextQuery", "TextLine", "TextLinesQuery", "MAX_TEXT_LINES",
     "Query", "EXACT", "CONTAINS",
     "ObservationResult", "Match", "PIXEL", "COLOR_REGION", "TEMPLATE", "TEXT", "TEXT_LINES", "KINDS",
-    "ObservationError", "InvalidQuery", "ObservationUnavailable", "OcrUnavailable", "OcrLanguageUnavailable",
+    "ObservationError", "InvalidQuery", "QUERY_CODES", "ObservationUnavailable", "OcrUnavailable",
+    "OcrLanguageUnavailable",
     "ObservationTimeout", "ObservationCancelled", "OcrProvider", "applies_text_confidence", "check_text_reader",
+    "check_picture",
     "OcrResult", "read_text", "reader_languages",
     "MAX_TIMEOUT_S", "DEFAULT_INTERVAL_S",
 ]

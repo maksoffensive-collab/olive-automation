@@ -45,6 +45,10 @@ class Issue:
     message: str
     index: int | None = None          # action index the issue is about (None: the macro / binding as a whole)
     severity: str = ERROR
+    params: tuple[tuple[str, object], ...] = ()   # the names and numbers a translated sentence needs
+    # about something an earlier step may still change (a window a recording clicks in, which an earlier block of a
+    # script may open): a script checks it when that macro's turn comes -- its own preflight -- not at its start
+    deferrable: bool = False
 
 
 @dataclass(frozen=True)

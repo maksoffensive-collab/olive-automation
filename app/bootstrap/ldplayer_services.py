@@ -79,8 +79,10 @@ class LDPlayerServices:
         stop = stop or EmergencyStop()
         runner = CommandRunner(stop)
         console = LDConsole(settings.ldconsole_path, runner, settings.ldconsole_timeout_s)
+        # The application may start LDPlayer's own ADB server (the person's decision of 2026-10-21: LDPlayer is
+        # controlled over ADB, and without the server no instance can even be verified); the tools never do.
         adb = AdbClient(settings.adb_path, runner, stop, timeout_s=settings.adb_timeout_s,
-                        retries=settings.retry_count, backoff_s=settings.retry_backoff_s)
+                        retries=settings.retry_count, backoff_s=settings.retry_backoff_s, allow_server_start=True)
         ldplayer_dir = settings.ldplayer_dir
         return cls(console, adb, lambda index: read_instance_config(ldplayer_dir, index),
                    lambda: listening_port_owners(runner), stop)
@@ -103,6 +105,9 @@ class LDPlayerServices:
         self._mapping = MappingService(registry, self._console, self._adb, self._stop, self._read_config,
                                        self._port_owners, self._log)
         running = {i.index for i in instances if i.pid != -1}
+        if running and getattr(self._adb, "may_start_server", False):
+            # so that the server is up by the time an instance is chosen; in the background, never waited for here
+            self._adb.start_server_soon()
         return [_entry(p, p.ld_index in running) for p in registry.all()]
 
     def verify(self, entry: TargetEntry) -> Target:
@@ -148,3 +153,15 @@ class LDPlayerServices:
     def guard_run(self, target: Target):
         """Nothing to watch: input goes to the device over its own connection, not to this computer's screen."""
         return contextlib.nullcontext()
+
+    def bring_to_front(self, target: Target, *, activate: bool = False) -> bool:
+        """Nothing to do: the device's screen is read and touched over its own connection, covered or not."""
+        return False
+
+    def screen_rect(self, target: Target):
+        """None: the device's screen is not a place on this computer's screen (a picker shows its picture)."""
+        return None
+
+    def escape_watch(self, entries):
+        """None of its own: this provider watches no keyboard (a combined application gets the Windows one)."""
+        return None

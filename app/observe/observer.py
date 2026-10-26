@@ -29,12 +29,12 @@ from app.vision.bitmap import VisionError
 from app.vision.color import find_color
 from app.vision.frame import Frame
 from app.vision.roi import Roi, resolve_roi
-from app.vision.template import fast_matcher, match_template
+from app.vision.template import NEEDS_FAST, check_template, fast_matcher, search_template
 
 from .errors import InvalidQuery, ObservationCancelled, OcrLanguageUnavailable, OcrUnavailable
 from .query import EXACT, ColorRegionQuery, PixelQuery, Query, TemplateQuery, TextLinesQuery, TextQuery
 from .result import COLOR_REGION, PIXEL, TEMPLATE, TEXT, TEXT_LINES, Match, ObservationResult
-from .scale import Resize, too_small
+from .scale import MIN_SIDE
 
 
 def _resolve(query_region: Roi | None, frame: Frame) -> Roi:
@@ -42,7 +42,7 @@ def _resolve(query_region: Roi | None, frame: Frame) -> Roi:
     try:
         return resolve_roi(query_region, frame.width, frame.height)
     except VisionError as exc:
-        raise InvalidQuery(str(exc)) from exc
+        raise InvalidQuery.of(exc) from exc
 
 
 def _result(kind: str, frame: Frame, query, *, found: bool, matches, captured_at: float, detail) -> ObservationResult:
@@ -55,7 +55,8 @@ def _result(kind: str, frame: Frame, query, *, found: bool, matches, captured_at
 def _observe_pixel(frame: Frame, query: PixelQuery, captured_at: float) -> ObservationResult:
     x, y = query.point
     if not (0 <= x < frame.width and 0 <= y < frame.height):
-        raise InvalidQuery(f"Point ({x}, {y}) is outside the {frame.width}x{frame.height} frame.")
+        raise InvalidQuery(f"Point ({x}, {y}) is outside the {frame.width}x{frame.height} frame.",
+                           code="point_outside_image", x=x, y=y, image=f"{frame.width}×{frame.height}")
     actual = frame.bitmap.pixel(x, y)
     distance = max(abs(a - b) for a, b in zip(actual, query.color))   # per-channel, like the tolerance
     found = distance <= query.tolerance
@@ -73,7 +74,7 @@ def _observe_color_region(frame: Frame, query: ColorRegionQuery, captured_at: fl
         found_color = find_color(frame, query.color, tolerance=query.tolerance, roi=region,
                                  min_pixels=1, max_points=0)
     except VisionError as exc:
-        raise InvalidQuery(str(exc)) from exc
+        raise InvalidQuery.of(exc) from exc
     total = region.width * region.height
     ratio = found_color.count / total if total else 0.0
     found = ratio >= query.min_ratio
@@ -84,68 +85,45 @@ def _observe_color_region(frame: Frame, query: ColorRegionQuery, captured_at: fl
                            "min_ratio": query.min_ratio})
 
 
-ANY_SIZE = tuple(round(0.5 + 0.05 * i, 2) for i in range(31))     # 50% .. 200%, in steps of 5%
-NEEDS_FAST = ("Looking for a picture in any size needs the optional fast picture search (requirements-vision.txt), "
-              "which is not installed.")
-
-
 def check_any_size(query: TemplateQuery) -> None:
     if query.any_size and fast_matcher() is None:
-        raise InvalidQuery(NEEDS_FAST)
+        raise InvalidQuery(NEEDS_FAST, code="needs_fast")
 
 
-def _observe_template(frame: Frame, query: TemplateQuery, captured_at: float, check: Callable[[], None],
-                      resize: Resize | None) -> ObservationResult:
-    check_any_size(query)
-    scale = 1.0
+def check_picture(picture) -> None:
+    """`InvalidQuery` now if `picture` can never be looked for: it is one flat colour (it has no shape)."""
     try:
-        if query.any_size:
-            found_matches, scale = _any_size(frame, query, check, resize)
-        else:
-            found_matches = match_template(frame, query.template, min_confidence=query.min_confidence,
-                                           roi=query.region, max_results=query.max_results)
+        check_template(picture)
     except VisionError as exc:
-        # Every refusal match_template makes is about the QUERY -- a template that does not fit the search
-        # area, a region outside the image, a template too plain to locate -- not about the image being
-        # unavailable, so they are all the caller's to fix.
-        raise InvalidQuery(str(exc)) from exc
-    matches = tuple(Match(Roi(m.x, m.y, m.width, m.height), m.confidence) for m in found_matches)
+        raise InvalidQuery.of(exc) from exc
+
+
+def check_template_query(query: TemplateQuery) -> None:
+    """`InvalidQuery` now -- before a run's first step -- if `query` can never be answered: in any size without the
+    fast search, or a picture of one flat colour."""
+    check_any_size(query)
+    check_picture(query.template)
+
+
+def _observe_template(frame: Frame, query: TemplateQuery, captured_at: float,
+                      check: Callable[[], None]) -> ObservationResult:
+    check_any_size(query)
+    try:
+        search = search_template(frame, query.template, min_confidence=query.min_confidence, roi=query.region,
+                                 max_results=query.max_results, any_size=query.any_size, min_side=MIN_SIDE,
+                                 check=check)
+    except VisionError as exc:
+        # Every refusal the search makes is about the QUERY -- a template that does not fit the search area, a
+        # region outside the image, a template of one flat colour -- not about the image being unavailable, so
+        # they are all the caller's to fix.
+        raise InvalidQuery.of(exc) from exc
+    matches = tuple(Match(Roi(m.x, m.y, m.width, m.height), m.confidence) for m in search.matches)
+    detail = {"min_confidence": query.min_confidence, "count": len(matches), "scale": search.scale}
+    if search.best is not None:          # where it came closest, found or not: what a person tunes a threshold by
+        b = search.best
+        detail["best"] = {"confidence": b.confidence, "x": b.x, "y": b.y, "width": b.width, "height": b.height}
     return _result(TEMPLATE, frame, query, found=bool(matches), matches=matches, captured_at=captured_at,
-                   detail={"min_confidence": query.min_confidence, "count": len(matches), "scale": scale})
-
-
-def _any_size(frame: Frame, query: TemplateQuery, check: Callable[[], None],
-              resize: Resize | None) -> tuple[list, float]:
-    """The size, of ANY_SIZE, at which the picture is found best (the highest confidence; nearer 100% first on a
-    tie). A size it cannot be searched at (too large for the area, too small to tell apart, too plain there) is
-    passed over. When nothing was found, the last refusal is the answer, if a size was refused after the last
-    search that could run (the safer answer: "not found" is said only of sizes that were all really searched).
-    `check` runs before each size (the stop and the caller's cancel are heard between sizes); `resize` makes the
-    picture at a size (the caller's cache)."""
-    area = query.region if query.region is not None else Roi(0, 0, frame.width, frame.height)
-    t = query.template
-    best: list = []
-    best_scale, refusal, tried = 1.0, None, set()
-    for factor in sorted(ANY_SIZE, key=lambda f: (abs(f - 1.0), f)):
-        w, h = round(t.width * factor), round(t.height * factor)
-        if too_small(t, w, h) or w > area.width or h > area.height or (w, h) in tried:
-            continue                                  # (a small picture: two factors can give the same size)
-        tried.add((w, h))
-        factor = round(w / t.width, 2)                # the size it is really searched at
-        check()
-        picture = resize(t, w, h) if resize is not None else t.resized(w, h)
-        try:
-            found = match_template(frame, picture, min_confidence=query.min_confidence, roi=query.region,
-                                   max_results=query.max_results)
-        except VisionError as exc:
-            refusal = exc
-            continue
-        refusal = None if found or best else refusal
-        if found and (not best or found[0].confidence > best[0].confidence):
-            best, best_scale = found, factor
-    if not best and refusal is not None:
-        raise refusal
-    return best, best_scale
+                   detail=detail)
 
 
 def _text_hits(blocks, query: TextQuery, *, filter_confidence: bool = True) -> list:
@@ -322,13 +300,13 @@ def _no_check() -> None:
 
 def observe(frame: Frame, query: Query, *, ocr: OcrProvider | None = None,
             captured_at: float | None = None, cancel: threading.Event | None = None,
-            check: Callable[[], None] = _no_check, resize: Resize | None = None) -> ObservationResult:
+            check: Callable[[], None] = _no_check) -> ObservationResult:
     """Apply one query to one already-captured frame.
 
     `captured_at` is when that frame was taken; it defaults to now, which is right for a frame captured for
     this call and wrong (but harmless, and visible in `age_s`) for a reused one -- so `ObservationContext`,
-    which is what reuses frames, always passes the real capture time. A look made of many (a picture in any size)
-    runs `check` between them, which raises to end it; `resize` makes a picture at another size."""
+    which is what reuses frames, always passes the real capture time. A picture search runs `check` between its
+    parts (the sizes of a search in any size), which raises to end it."""
     if not isinstance(frame, Frame):
         raise InvalidQuery("observe() needs a Frame from the verified screenshot pipeline.")
     taken = time.time() if captured_at is None else captured_at
@@ -337,7 +315,7 @@ def observe(frame: Frame, query: Query, *, ocr: OcrProvider | None = None,
     if isinstance(query, ColorRegionQuery):
         return _observe_color_region(frame, query, taken)
     if isinstance(query, TemplateQuery):
-        return _observe_template(frame, query, taken, check, resize)
+        return _observe_template(frame, query, taken, check)
     if isinstance(query, TextQuery):
         return _observe_text(frame, query, taken, ocr, cancel)
     if isinstance(query, TextLinesQuery):

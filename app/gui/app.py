@@ -51,6 +51,7 @@ from app.gui.services import AutomationServices
 from app.gui.view import dialogs, fmt, skin
 from app.gui.view import widgets as w
 from app.gui.view.editor import EditorScreen
+from app.gui.view.graph_editor import GraphEditorScreen
 from app.gui.view.history import HistoryScreen
 from app.gui.view.macros import MacrosScreen
 from app.gui.view.panels import DiagnosticsScreen, SettingsScreen
@@ -60,7 +61,7 @@ from app.observe import OcrProvider
 POLL_MS = 100
 CRUMB_CHARS = 28          # a breadcrumb part: a name is clipped, the header keeps its width whatever the names
 TARGET_CHARS = 26
-SCREENS = ("macros", "scripts", "editor", "history", "text", "settings", "diagnostics")
+SCREENS = ("macros", "scripts", "editor", "graph", "history", "text", "settings", "diagnostics")
 NAV = (("macros", "nav_macros", "record"), ("scripts", "nav_scripts", "flow"), ("text", "nav_text", "text"),
        ("history", "nav_history", "history"))
 NAV_FOOT = (("settings", "nav_settings", "settings"),)
@@ -155,6 +156,10 @@ class App:
         root.configure(background=th.ACTIVE.bg)
         self.on_theme(lambda: root.configure(background=th.ACTIVE.bg))
         self._style()
+        # Tk's drop-down list steps through its values on the wheel, so scrolling a panel over one changed a choice
+        # nobody meant to change (the person's report of 2026-10-25). The wheel over a list now scrolls what holds
+        # it -- the event goes on to the window's own wheel binding -- and only a click changes the choice.
+        root.bind_class("TCombobox", "<MouseWheel>", lambda _e: None)
         root.columnconfigure(1, weight=1)
         root.rowconfigure(0, weight=1)
 
@@ -175,6 +180,7 @@ class App:
         for name, screen in (("macros", MacrosScreen(self, container, kind=KIND_MACROS)),
                              ("scripts", MacrosScreen(self, container, kind=KIND_SCRIPTS)),
                              ("editor", EditorScreen(self, container)),
+                             ("graph", GraphEditorScreen(self, container)),
                              ("history", HistoryScreen(self, container)), ("text", TextScreen(self, container)),
                              ("settings", SettingsScreen(self, container)),
                              ("diagnostics", DiagnosticsScreen(self, container))):
@@ -192,6 +198,7 @@ class App:
     def _build_nav(self) -> None:
         nav = ttk.Frame(self.root, style="Sidebar.TFrame", padding=(12, 18, 13, 14), width=th.NAV_WIDTH)
         nav.grid(row=0, column=0, sticky="ns")
+        self.nav = nav
         nav.pack_propagate(False)
         edge = tk.Frame(nav, width=1, background=th.ACTIVE.border)
         edge.place(relx=1.0, rely=0.0, relheight=1.0, anchor="ne")
@@ -421,8 +428,17 @@ class App:
 
     # ---- navigation and global actions ----------------------------------------------------------------
     def show_screen(self, name: str) -> None:
+        if name == "editor" and self.controller.editing_graph:
+            name = "graph"                            # a version-4 script opens in its own editor
         if name not in self.screens:
             return
+        if self.screen == "graph" and name != "graph":
+            if not self.screens["graph"].leave():     # never leave unsaved work behind silently
+                return
+        if name == "graph" and self.screen != "graph":
+            self._full_screen(True)
+        elif name != "graph" and self.screen == "graph":
+            self._full_screen(False)
         if self.screen == "editor" and name != "editor":
             if self.controller.editor_dirty:
                 self.screens["editor"].go_back()      # never leave unsaved work behind silently
@@ -441,7 +457,33 @@ class App:
         self._paint_nav()
         self.render()
 
+    def _full_screen(self, on: bool) -> None:
+        """The version-4 editor fills the screen (the person's list of 2026-10-25): the window maximised, the
+        navigation and the page header out of the way -- and both back, the window as it was, once it is left. The
+        stop bar stays: the emergency stop is never hidden."""
+        root = self.root
+        if on:
+            self._before_full = (root.state(), root.geometry())
+            self.nav.grid_remove()
+            self.header.grid_remove()
+            try:
+                root.state("zoomed")
+            except tk.TclError:
+                pass
+        else:
+            self.nav.grid()
+            self.header.grid()
+            state, geometry = getattr(self, "_before_full", ("normal", ""))
+            try:
+                root.state(state if state in ("normal", "zoomed") else "normal")
+                if state == "normal" and geometry:
+                    root.geometry(geometry)
+            except tk.TclError:
+                pass
+
     def _active_nav(self) -> str:
+        if self.screen == "graph":
+            return "scripts"
         if self.screen == "editor":
             return "scripts" if self.controller.editing_v2 else "macros"
         if self.screen == "diagnostics":
@@ -455,6 +497,10 @@ class App:
             button.configure(style="NavActive.TButton" if on else "Nav.TButton",
                              image=self.icon(glyph, th.ACTIVE.sidebar_icon_active if on else th.ACTIVE.sidebar_icon,
                                              pad=10))
+
+    def choose_target(self) -> None:
+        """The target chooser, for a screen that needs one chosen before it can go on (a picker, say)."""
+        self._choose_target()
 
     def _choose_target(self) -> None:
         """The one target that recording, reading text and the screen pickers use. Explicit, verified, never all:
@@ -508,18 +554,18 @@ class App:
         return "break"
 
     def _key_save(self, _event=None) -> str:
-        if self.screen == "editor":
-            self.screens["editor"].save()
+        if self.screen in ("editor", "graph"):
+            self.screens[self.screen].save()
         return "break"
 
     def _key_undo(self, _event=None) -> str:
-        if self.screen == "editor":
+        if self.screen in ("editor", "graph"):
             self.controller.editor_undo()
             self.render()
         return "break"
 
     def _key_redo(self, _event=None) -> str:
-        if self.screen == "editor":
+        if self.screen in ("editor", "graph"):
             self.controller.editor_redo()
             self.render()
         return "break"
@@ -727,9 +773,12 @@ class App:
         status = status if status is not None else self.controller.status
         if status.key:
             try:
-                return self.t(status.key).format(**status.values)
+                text = self.t(status.key).format(**status.values)
             except (KeyError, IndexError, ValueError):
                 return status.text
+            why = status.values.get("why")          # a run that did not finish: why, in the person's words
+            reason = fmt.explain_lines(self, why)[:1] if isinstance(why, str) and why else []
+            return "\n".join([text] + reason)
         return status.text
 
     def _render_header(self) -> None:
@@ -765,6 +814,8 @@ class App:
 
     def _titles(self) -> tuple[str, str]:
         c, t = self.controller, self.t
+        if self.screen == "graph":
+            return t("editor_title_script"), self._breadcrumb()
         if self.screen == "editor":
             return t("editor_title_script" if c.editing_v2 else "editor_title_macro"), self._breadcrumb()
         title = t(TITLE[self.screen])
@@ -776,7 +827,7 @@ class App:
         chosen macro or script. It names places in the application, never a file path."""
         if self.screen in ("history", "text", "settings", "diagnostics"):
             return self.t(TITLE[self.screen])
-        scripts = self.screen == "scripts" or (self.screen == "editor" and self.controller.editing_v2)
+        scripts = self.screen in ("scripts", "graph") or (self.screen == "editor" and self.controller.editing_v2)
         parts = [self.t("nav_scripts" if scripts else "nav_macros")]
         flt = self.controller.filter
         if flt.scope is Scope.FOLDER and flt.folder:
@@ -784,7 +835,7 @@ class App:
         elif flt.scope is not Scope.ALL:
             parts.append(self.t({Scope.FAVORITES: "scope_favorites",
                                  Scope.RECENT: "scope_recent"}[flt.scope]))
-        if self.screen == "editor" and self.controller.editor is not None:
+        if self.screen in ("editor", "graph") and self.controller.editor is not None:
             parts.append(fmt.clip(self.controller.editor.document.name or self.t("unnamed"), CRUMB_CHARS))
         else:
             info = self.controller.shown_macro()

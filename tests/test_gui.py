@@ -23,9 +23,11 @@ from app.gui.library import LibraryError, MacroLibrary, slugify
 from app.gui.macro_list import Scope
 from app.gui.prefs import PreferencesStore
 from app.gui.services import AutomationServices, TargetEntry
+from app.observe import QUERY_CODES
 from app.playback.engine import PlaybackState
 from app.playback.macro import Macro
 from app.providers.input import Key
+from app.vision.roi import Roi
 from app.providers.recording import PointerButton as B, RecordedEvent as E, RecordedEventKind as K, Recording
 from app.windows.backend import InputDeliveryError, WindowInputBackend
 from tests.test_recorder import FakeObserver, MS, VK_A, VK_F10
@@ -42,6 +44,11 @@ class World(FakeDesktop, WindowInputBackend):
     def __init__(self, *windows):
         super().__init__(*windows)
         self.events, self.size, self.on_event = [], (60, 40), None
+        self.fronted, self.covered = [], False      # raise_window calls (they send nothing), and its answer
+
+    def raise_window(self, hwnd, *, activate):
+        self.fronted.append((hwnd, activate))
+        return self.covered
 
     def client_size(self, hwnd):
         return self.size if hwnd in self.windows else None
@@ -130,6 +137,16 @@ class Base(unittest.TestCase):
         self.observer.key(VK_A, True, 200)
         self.observer.key(VK_A, False, 230)
         self.assertTrue(self.c.stop_recording(), self.c.status)
+
+    def copied_in(self, name):
+        """A recorded macro that reached the library without Olive saving it (copied in by hand, or written by another
+        copy of Olive): it remembers no target, so nothing is chosen for it (the person's list of 2026-10-25,
+        item 12). Returns its key."""
+        self.record()
+        path = self.library.save(Macro(self.c.macro.recording, name))
+        self.assertTrue(self.c.discard_recording(), self.c.status)
+        self.c.refresh_macros()
+        return self.library.key_of(path)
 
     def finish_playback(self):
         self.assertTrue(self.c.engine.wait(10), "playback did not end")
@@ -1070,6 +1087,7 @@ class I18nCoverage(unittest.TestCase):
                  ("completed", "partial", "failed", "stopped", "refused")}
         keys |= {"msg_macro_not_valid"}                                    # returned by why_cannot_run()
         keys |= {"msg_probe_false"}                                        # the other half of a conditional key
+        keys |= {f"err_query_{code}" for code in QUERY_CODES}             # built as f"err_query_{code}"
         return keys
 
     def test_every_sentence_the_controller_can_show_has_a_translation(self):
@@ -1086,6 +1104,34 @@ class I18nCoverage(unittest.TestCase):
             if len(set(map(frozenset, fields.values()))) != 1:
                 mismatched[key] = fields
         self.assertEqual(mismatched, {})
+
+    def test_a_search_refusal_is_said_with_the_numbers_it_carries(self):
+        """2026-10-25: a picture larger than its area (and every other refusal a person can meet) was English; each
+        code's sentence takes exactly the numbers its error carries, in both languages."""
+        from app.observe import InvalidQuery
+        from app.observe.scale import scaled_query
+        from app.vision.bitmap import Bitmap, VisionError
+        from app.vision.template import search_template, check_template
+        from app.observe import TemplateQuery
+        from tests.test_vision import frame_of
+        picture = Bitmap(30, 20, bytes((x * 7 + y * 13 + c * 50) % 256 for y in range(20) for x in range(30)
+                                       for c in range(3)))
+        raised = []
+        for call in (lambda: search_template(frame_of(Bitmap(64, 48, bytes(64 * 48 * 3))), picture,
+                                             roi=Roi(0, 0, 20, 15)),
+                     lambda: check_template(Bitmap(4, 4, bytes(48))),
+                     lambda: Roi(10, 10, 100, 50).check_within(64, 48),
+                     lambda: scaled_query(TemplateQuery(picture), 0.05, 0.05, 64, 48)):
+            try:
+                call()
+            except (VisionError, InvalidQuery) as exc:
+                raised.append(exc)
+        self.assertEqual([e.code for e in raised], ["picture_larger_than_area", "flat_picture",
+                                                    "area_outside_image", "picture_too_small"])
+        for exc in raised:
+            for lang in LANGUAGES:
+                text = _STRINGS[f"err_query_{exc.code}"][lang].format(**exc.params)
+                self.assertNotIn("{", text)
 
     def test_every_string_is_translated_into_every_supported_language(self):
         missing = {key: [lang for lang in LANGUAGES if lang not in entry] for key, entry in _STRINGS.items()}
@@ -1153,11 +1199,16 @@ class Shell(Base):
         setattr(dialogs, name, Stub)
         self.addCleanup(setattr, dialogs, name, original)
 
-    def make(self, name="Farm", *, folder=""):
-        self.record()
-        self.assertTrue(self.c.save(name, folder=folder), self.c.status)
-        self.c.refresh_macros()
-        key = next(i.key for i in self.c.macros if i.name == name)
+    def make(self, name="Farm", *, folder="", remembered=True):
+        """A macro recorded on Notes and saved, chosen in the list. `remembered=False`: one copied into the library
+        instead, which remembers no target."""
+        if remembered:
+            self.record()
+            self.assertTrue(self.c.save(name, folder=folder), self.c.status)
+            self.c.refresh_macros()
+            key = next(i.key for i in self.c.macros if i.name == name)
+        else:
+            key = self.copied_in(name)
         self.macros.select_row(key)
         return key
 
@@ -1258,11 +1309,33 @@ class MacroScreenView(Shell):
         self.assertEqual(self.c.why_cannot_run(), "msg_pick_macro")
 
     def test_choosing_a_macro_fills_the_panel_that_carries_run(self):
-        self.make("Farm")
+        self.make("Farm", remembered=False)
         self.app.render()
         self.assertEqual(self.macros.lbl_name.cget("text"), "Farm")
         self.assertIn("disabled", self.macros.btn_run.state())          # still no targets
         self.assertEqual(self.c.why_cannot_run(), "msg_no_run_targets")
+
+    def test_a_recorded_macro_shows_the_target_it_was_recorded_on_ready_to_run(self):
+        """Item 12 of 2026-10-25: a macro remembers its target -- here the window it was recorded on."""
+        self.make("Farm")
+        self.app.render()
+        self.assertIn("Notes", self.macros.lbl_targets.cget("text"))
+        self.assertNotIn("disabled", self.macros.btn_run.state())
+        self.assertEqual(self.c.run_refs, (self.entry("Notes").ref,))
+
+    def test_the_group_of_a_target_is_said_in_the_persons_language(self):
+        """Seen in the visual check of item 12: "Open Windows" stood in English in the Russian panel."""
+        self.make("Farm")
+        self.app.apply_language("ru")
+        self.app.render()
+        shown = self.macros.lbl_targets.cget("text")
+        self.assertIn("Открытые окна", shown)
+        self.assertNotIn("Open Windows", shown)
+        from app.gui.view import fmt
+        self.assertEqual(fmt.group_label(self.app, "Full Windows"), "Full Windows")     # a name stays a name
+        self.c.set_run_refs([self.entry("Full Windows").ref])
+        self.app.render()
+        self.assertNotIn("Full Windows  ·  Full Windows", self.macros.lbl_targets.cget("text"))   # said once
 
     def test_run_becomes_available_only_once_targets_are_chosen(self):
         self.make("Farm")
@@ -1395,7 +1468,7 @@ class MacroScreenView(Shell):
     def test_another_macro_does_not_show_or_use_the_targets_chosen_for_the_first(self):
         self.make("Farm")
         self.c.set_run_refs([self.entry("Notes").ref])
-        self.make("Daily")                                               # chosen in the list: another macro
+        self.make("Daily", remembered=False)                             # chosen in the list: another macro
         self.app.render()
         self.assertEqual(self.macros.lbl_name.cget("text"), "Daily")
         shown = self.macros.lbl_targets.cget("text")
@@ -1411,7 +1484,7 @@ class MacroScreenView(Shell):
         self.make("Farm")
         notes = self.entry("Notes").ref
         self.c.set_run_refs([notes])
-        self.make("Daily")
+        self.make("Daily", remembered=False)
         offered, answers = [], [None, (notes,)]
 
         class Picker:

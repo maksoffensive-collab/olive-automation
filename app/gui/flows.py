@@ -21,13 +21,18 @@ from __future__ import annotations
 import contextlib
 import threading
 import time
+from typing import Callable
 
-from app.decide import Decision, FlowReport, FlowState, RunMacro, TapMatch, WaitUntil, adapting, run_steps, walk
+from app.decide import (AT_POINT, CANCELLED, COMPLETED, ENTER, ERROR, LEAVE, CheckNode, ClickNode, Decision,
+                        FlowReport, FlowState, GraphReport, MacroNode, RunMacro, Script, TapMatch, WaitUntil,
+                        adapting, run_graph, run_steps, walk)
 from app.decide.format import ConditionalMacro
+from app.gui import explain
 from app.gui.services import AutomationServices
 from app.observe import ObservationContext, OcrProvider
 from app.playback.macro import REQUIRED_CAPABILITY, ActionOp, Macro
 from app.providers.base import Screenshot, ScreenshotProvider
+from app.providers.size import fit
 from app.providers.target import Capability, Target
 
 
@@ -69,6 +74,17 @@ def observes(flow: ConditionalMacro) -> bool:
     return any(isinstance(part, (WaitUntil, Decision)) for part in _blocks(flow))
 
 
+def clicks_at_fixed_points(flow: ConditionalMacro) -> bool:
+    """Whether a run of `flow` may click where nothing was looked at: beside a match, or at the recorded points of a
+    macro that does not know its own size (they follow the script's size, so only in its proportions)."""
+    for _path, item in walk(flow.steps):
+        if isinstance(item, TapMatch) and item.offset != (0, 0):
+            return True
+        if isinstance(item, RunMacro) and item.macro.recording.size is None:
+            return True
+    return False
+
+
 def refusal(flow: ConditionalMacro, target: Target) -> str:
     """Why this flow cannot run on this target at all, before anything is observed -- or "".
 
@@ -105,16 +121,26 @@ class FlowJob:
 
     def __init__(self, flow: ConditionalMacro, target: Target, services: AutomationServices, *,
                  ocr: OcrProvider | None, dry_run: bool, allow_different_target: bool,
-                 delay_s: float | None = None) -> None:
+                 delay_s: float | None = None, uncovered: bool = False,
+                 on_acting: Callable[[], None] | None = None) -> None:
+        """`uncovered`: the target was brought to the front just before (the start of the run), so its first look
+        waits for it to draw itself; `on_acting` is called once the start delay is over, before the first step (the
+        run's Esc watch starts there; what it raises ends the run before anything is done)."""
         self.flow, self.target = flow, target
+        self._on_acting = on_acting
         self.total = len(flow.steps)
         self._services = services
         self._dry_run, self._allow = dry_run, allow_different_target
         self._cancel = threading.Event()
         self.cancel_reason = ""
-        # a script that adapts asks its points and areas at the size the target has now (picked at `flow.size`)
+        # a script that adapts asks its points and areas at the size the target has now (picked at `flow.size`);
+        # before each look its target is brought to the front, so nothing covers what it shows (the person's
+        # decision of 2026-10-25) -- raised only: the keyboard focus is taken once, when the run starts
         self.context = ObservationContext(ServiceScreens(services, target), stop=services.stop, ocr=ocr,
-                                          picked_on=flow.size if flow.adapt else None)
+                                          picked_on=flow.size if flow.adapt else None,
+                                          prepare=lambda: services.bring_to_front(target))
+        if uncovered:
+            self.context.settle_next()
         self.report: FlowReport | None = None
         self.error: BaseException | None = None
         # how long THIS target waits before its first step: what is left of the run's one delay (`delay_s`, from the
@@ -138,9 +164,15 @@ class FlowJob:
         start delay, when nothing is being done; a watch that cannot start ends the run here."""
         if self.delay_s:
             self._services.recheck(self.target)
-        # other proportions, or a picture too small at this size: refused before anything is done
+        if self._on_acting is not None:
+            self._on_acting()
+        # a picture too small (or made flat) at this size, or -- for a click where nothing is looked at: beside the
+        # match, or at the points of a recorded macro of unknown size -- other proportions: refused before anything
+        # is done (a look follows any size; such a click would land somewhere else)
         self.context.check_size(item.condition.query for _path, item in walk(self.flow.steps)
                                 if isinstance(item, (WaitUntil, Decision)))
+        if self.context.picked_on is not None and clicks_at_fixed_points(self.flow):
+            self.context.scale()
         self.acting = True
         guard = contextlib.nullcontext() if self._dry_run else self._services.guard_run(self.target)
         with guard:
@@ -209,3 +241,164 @@ class FlowJob:
         if report.reason == "action_refused" and done == 0 and len(report.steps) <= 1:
             return "refused", done, detail
         return "failed", done, detail
+
+
+# ---- version 4: blocks joined by arrows ------------------------------------------------------------------------
+_CLICK_OPS = {"tap": ActionOp.TAP, "double": ActionOp.DOUBLE_TAP, "right": ActionOp.SECONDARY_TAP,
+              "hold": ActionOp.BUTTON_DOWN, "drag": ActionOp.BUTTON_DOWN}
+
+
+def graph_refusal(script: Script, target: Target, macros: dict) -> str:
+    """Why this version-4 script cannot run on this target at all, before anything is observed -- or "": what the
+    target declares it can do, and every recorded macro its macro blocks name (read by the caller; one that is gone
+    is refused here, not met half-way)."""
+    nodes = script.nodes
+    if any(isinstance(n, CheckNode) for n in nodes) and not target.has_capability(Capability.SCREENSHOT):
+        return "unsupported_capability: this target cannot take screenshots, so it cannot be observed."
+    for node in nodes:
+        if isinstance(node, MacroNode):
+            if not node.macro or node.macro not in macros:
+                return "macro_missing: a macro block names a macro that is not in the library."
+            macro = macros[node.macro]
+            if macro.target.provider_id != target.provider_id:
+                return (f"wrong_provider: “{macro.name}” was recorded for {macro.target.provider_id}, "
+                        f"the target belongs to {target.provider_id}.")
+        if isinstance(node, ClickNode):
+            ops = [_CLICK_OPS[node.how]] + ([ActionOp.MOVE, ActionOp.BUTTON_UP] if node.how == "drag" else [])
+            if node.how == "hold":
+                ops.append(ActionOp.BUTTON_UP)
+            for op in ops:
+                needed = REQUIRED_CAPABILITY.get(op)
+                if needed is not None and not target.has_capability(needed):
+                    return f"unsupported_capability: this target cannot do a {node.how} click."
+    return ""
+
+
+class GraphJob:
+    """One version-4 run on one target, in a thread of its own: shaped like `FlowJob`, so the batch drives both the
+    same way. Every block reports itself as it runs (`lit`: block id -> "running" / "visited" / "failed"), so the
+    editor can light the block that runs."""
+
+    def __init__(self, script: Script, target: Target, services: AutomationServices, *, macros: dict,
+                 ocr: OcrProvider | None, dry_run: bool, allow_different_target: bool,
+                 delay_s: float | None = None, uncovered: bool = False,
+                 on_acting: Callable[[], None] | None = None) -> None:
+        self.flow, self.target, self.macros = script, target, dict(macros)
+        self.total = len(script.nodes)
+        self._services = services
+        self._dry_run, self._allow = dry_run, allow_different_target
+        self._on_acting = on_acting
+        self._cancel = threading.Event()
+        self.cancel_reason = ""
+        self.context = ObservationContext(ServiceScreens(services, target), stop=services.stop, ocr=ocr,
+                                          prepare=lambda: services.bring_to_front(target))
+        if uncovered:
+            self.context.settle_next()
+        self.delay_s = 0.0 if dry_run else float(script.start.delay_s if delay_s is None else delay_s)
+        self.acting = False
+        self.report: GraphReport | None = None
+        self.error: BaseException | None = None
+        self._lit: dict[str, str] = {}
+        self._lit_lock = threading.Lock()
+        self._started_at: float | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True, name=f"graph-{target.target_id}")
+
+    # ---- what the editor shows ------------------------------------------------------------------------------
+    def _event(self, node: str, phase: str) -> None:
+        with self._lit_lock:
+            for other, state in list(self._lit.items()):
+                if state == "running":
+                    self._lit[other] = "visited"
+            self._lit[node] = {ENTER: "running", LEAVE: "visited", ERROR: "failed"}.get(phase, "visited")
+
+    @property
+    def lit(self) -> dict[str, str]:
+        with self._lit_lock:
+            return dict(self._lit)
+
+    def starts_in(self) -> float:
+        if self.acting or not self.delay_s or self._started_at is None:
+            return 0.0
+        return max(0.0, self._started_at + self.delay_s - time.monotonic())
+
+    @contextlib.contextmanager
+    def _acting(self):
+        """From the first block to the end of the run: the target checked again after a start delay, the run's Esc
+        watch started, a click at a picked point checked against the size the target has now (other proportions:
+        refused before anything is done), and the provider's watch for the person taking over."""
+        if self.delay_s:
+            self._services.recheck(self.target)
+        if self._on_acting is not None:
+            self._on_acting()
+        # a picture too small (or made flat) at the size the target has now: refused before anything is done
+        self.context.check_sizes((p.condition.query, p.size) for n in self.flow.nodes if isinstance(n, CheckNode)
+                                 for p in n.parts if p.size is not None)
+        sized = [n for n in self.flow.nodes if isinstance(n, ClickNode) and n.where == AT_POINT and n.size]
+        if sized:
+            frame = self.context.frame(max_age_s=1.0)
+            for node in sized:
+                fit(node.size, (frame.width, frame.height))          # SizeChanged: nothing has been done yet
+        self.acting = True
+        guard = contextlib.nullcontext() if self._dry_run else self._services.guard_run(self.target)
+        with guard:
+            yield
+
+    def _run(self) -> None:
+        try:
+            self.report = run_graph(self.flow, target=self.target, context=self.context, macros=self.macros,
+                                    create_playback=self._services.create_playback, stop=self._services.stop,
+                                    cancel=self._cancel, dry_run=self._dry_run, allow_different_target=self._allow,
+                                    on_event=self._event, start_delay_s=self.delay_s, while_acting=self._acting)
+        except BaseException as exc:          # malformed input is raised before anything is observed
+            self.error = exc
+
+    def start_in_background(self) -> None:
+        self._started_at = time.monotonic()
+        self._thread.start()
+
+    @property
+    def running(self) -> bool:
+        return self._thread.is_alive()
+
+    def cancel(self, reason: str = "cancelled") -> None:
+        if not self.cancel_reason:
+            self.cancel_reason = reason
+        self._cancel.set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+    def let_go(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """What the playbacks of this run let go of as each ended, and what is still held (its release refused)."""
+        report = self.report
+        return (tuple(report.released), tuple(report.held)) if report is not None else ((), ())
+
+    def outcome(self) -> tuple[str, int, str]:
+        """(state, blocks reached, detail) once the thread has ended; state is a `RunState` value. The detail is
+        `<reason>@<block> {params}: <words>` (app/gui/explain.py); what a playback could not let go of is added
+        ("still held: ...")."""
+        state, done, detail = self._outcome()
+        held = self.let_go()[1]
+        if held:
+            detail = "; ".join(filter(None, (detail, "still held: " + ", ".join(held))))
+        return state, done, detail
+
+    def _outcome(self) -> tuple[str, int, str]:
+        if self.error is not None:
+            return "failed", 0, f"{type(self.error).__name__}: {self.error}"
+        report = self.report
+        if report is None:
+            return "stopped", 0, "the run ended before this target finished"
+        if report.state == COMPLETED:
+            return "completed", report.visited, ""
+        if report.state == CANCELLED:
+            reason = report.reason if report.reason == "emergency_stop" else (self.cancel_reason or "cancelled")
+            return "stopped", report.visited, explain.encode(reason, report.node)
+        message = report.message
+        if report.issues:
+            message += " (" + "; ".join(f"{i.code}: {i.message}" for i in report.issues) + ")"
+        params = dict(report.params)
+        if report.issues:
+            params.setdefault("issues", "; ".join(i.message for i in report.issues))
+        return "failed", report.visited, explain.encode(report.reason, report.node, params, message)

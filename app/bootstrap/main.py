@@ -176,23 +176,34 @@ def self_check(path: str) -> int:
             raise ImportError("the text recognition engine could not be loaded")
 
     def picture_search() -> None:
-        """One real search: a 2 x 2 picture must be found exactly where it is in a 4 x 4 one, and nowhere else."""
-        from app.vision.roi import Roi
-        corner = bytes(range(10, 130, 10))                  # four distinct colours
-        rgb = bytearray(4 * 4 * 3)
-        for row in (2, 3):
-            start = (row * 4 + 2) * 3
-            rgb[start:start + 6] = corner[(row - 2) * 6:(row - 1) * 6]
-        found = fast(bytes(rgb), 4, 4, Roi(0, 0, 4, 4), corner, 2, 2, 0.0, 10)
-        if found != [(0, 2, 2)]:
-            raise ValueError(f"wrong answer {found!r}")
+        """One real search with the fast picture search: a 3 x 3 picture of nine colours must be found exactly where it
+        is in an 8 x 8 one, and nowhere else."""
+        from app.providers.base import ScreenshotProvider, TargetIdentity
+        from app.vision.bitmap import Bitmap, encode_png
+        from app.vision.frame import Frame
+        from app.vision.template import search_template
+        pattern = bytes((i * 97) % 251 for i in range(27))
+        rgb = bytearray(8 * 8 * 3)
+        for row in range(3):
+            start = ((4 + row) * 8 + 3) * 3
+            rgb[start:start + 9] = pattern[row * 9:(row + 1) * 9]
+        picture = Bitmap(8, 8, bytes(rgb))
+
+        class Picture(ScreenshotProvider):
+            identity = TargetIdentity("self-check", "picture")
+
+            def capture(self):
+                return self._issue_screenshot(encode_png(picture), 8, 8)
+        found = search_template(Frame.from_screenshot(Picture().capture()), Bitmap(3, 3, pattern),
+                                min_confidence=0.99, max_results=5)
+        if [(m.x, m.y, m.confidence) for m in found.matches] != [(3, 4, 1.0)]:
+            raise ValueError(f"wrong answer {found.matches!r}")
 
     attempt("window", window)
     attempt("application", application)
     attempt("text_recognition", text_recognition)
     from app.vision.template import fast_matcher
-    fast = fast_matcher()
-    if fast is None:
+    if fast_matcher() is None:
         checks["fast_picture_search"] = "unavailable"
     else:
         attempt("fast_picture_search", picture_search)

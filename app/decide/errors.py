@@ -34,3 +34,31 @@ class InvalidDecision(DecisionError):
 
 class Cancelled(PlatformError):
     """This run was cancelled by its caller. Not an emergency stop and not a failure."""
+
+
+# How a macro a run played ended, when it did not complete (`run.perform`, the one road to playback): in this
+# layer's own words, so nothing but run.py needs to know the playback engine's.
+class ActionRefused(DecisionError):
+    """Preflight said no; nothing was sent. `issues` say why."""
+
+    def __init__(self, message: str, issues=()) -> None:
+        super().__init__(message)
+        self.issues = tuple(issues)
+
+
+class ActionFailed(DecisionError):
+    """The macro started and failed part-way; `code` is the playback's own, `report` its report (what it let go
+    of as it ended, and what it could not)."""
+
+    def __init__(self, message: str, code: str = "", report=None) -> None:
+        super().__init__(message)
+        self.code, self.report = code, report
+
+
+class ActionCancelled(Cancelled):
+    """The macro was cancelled while it played; `reason` says by what ("emergency_stop", "cancelled", ...),
+    `report` is its report."""
+
+    def __init__(self, reason: str, report=None) -> None:
+        super().__init__(reason)
+        self.reason, self.report = reason, report

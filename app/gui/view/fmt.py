@@ -10,8 +10,10 @@ editor's properties panel is the one place that shows the text itself, because t
 from __future__ import annotations
 
 import time
+from decimal import ROUND_DOWN, Decimal
 
 from app.decide import Condition, Decision, RunMacro, TapMatch, WaitUntil
+from app.gui import explain
 from app.gui import flow_edit as fe
 from app.gui.macro_edit import Block, BlockKind
 from app.observe import ColorRegionQuery, PixelQuery, TemplateQuery, TextLinesQuery
@@ -39,6 +41,16 @@ def clip(text: str, limit: int) -> str:
 
 def number(ui, value: float, digits: int = 1) -> str:
     text = f"{value:.{digits}f}".rstrip("0").rstrip(".")
+    return (text or "0").replace(".", ui.t("decimal_sep"))
+
+
+def confidence(ui, value: float, threshold: float | None = None, *, places: int = 3) -> str:
+    """A confidence never shown as more than it is: cut, not rounded (0.99984 is "0.999", never "1"), to `places`
+    or to as many as `threshold` has, so the number shown is on the same side of the threshold as the real one."""
+    if threshold is not None:
+        places = max(places, min(9, -Decimal(repr(float(threshold))).normalize().as_tuple().exponent))
+    cut = Decimal(repr(float(value))).quantize(Decimal(1).scaleb(-places), rounding=ROUND_DOWN)
+    text = f"{cut:f}".rstrip("0").rstrip(".")                      # always has places: never strips a whole number
     return (text or "0").replace(".", ui.t("decimal_sep"))
 
 
@@ -80,6 +92,25 @@ def counted(ui, key: str, count: int) -> str:
     return ui.t(f"{key}_one" if count == 1 else key).format(count=count)
 
 
+def places_lines(ui, places, width: int = 44, most: int = 4) -> list[str]:
+    """The windows a Full Windows recording's clicks go into: a heading, then each recorded window once (by its
+    first title and program), on a line of its own (shortened to `width` characters), at most `most` of them."""
+    first: dict[int, object] = {}
+    for p in places:
+        first.setdefault(p.window, p)
+    named = [ui.t("details_place").format(title=p.title or "—", program=p.program) for p in first.values()]
+    lines = [ui.t("details_places")] + ["  " + clip(name, width) for name in named[:most]]
+    if len(named) > most:
+        lines.append("  " + ui.t("details_more_steps").format(count=len(named) - most))
+    return lines
+
+
+def group_label(ui, group: str) -> str:
+    """A provider's group label in the person's language where Olive knows it ("Open Windows"); any other, and a
+    name such as "Full Windows", as the provider wrote it."""
+    return ui.t("group_open_windows") if group == "Open Windows" else group
+
+
 def target_detail(ui, entry, *, with_group: bool = False) -> str:
     """The second line of a target row: which provider offers it and that provider's own note about it.
 
@@ -88,7 +119,7 @@ def target_detail(ui, entry, *, with_group: bool = False) -> str:
     and as a window by another -- apart before one of them is chosen."""
     parts = [entry.provider_id]
     if with_group and entry.group:
-        parts.append(entry.group)
+        parts.append(group_label(ui, entry.group))
     if entry.size:
         parts.append(entry.size)
     return "  ·  ".join(part for part in parts if part)
@@ -276,3 +307,41 @@ def countdown(seconds: float) -> str:
 
 def step_line(ui, step) -> str:
     return f"{step_title(ui, step)} — {step_detail(ui, step)}"
+
+
+# ---- why a run stopped, where, what to do (the person's list of 2026-10-25, item 9) -----------------------------
+_BLOCK_KEYS = {"start": "graph_block_start", "wait": "graph_block_wait", "check": "graph_block_check",
+               "repeat": "graph_block_repeat", "click": "graph_block_click", "macro": "graph_block_macro",
+               "stop": "graph_block_stop"}
+
+
+def _say(ui, key: str, values: dict) -> str:
+    """The sentence of `key`, or "" when there is none (or it needs a number the detail does not have)."""
+    text = ui.t(key)
+    if text == key:
+        return ""
+    try:
+        return text.format(**values)
+    except (KeyError, IndexError, ValueError):
+        return ""
+
+
+def explain_lines(ui, detail: str) -> list[str]:
+    """A result's detail in the person's words: why it stopped, in which block, and what to do -- the lines a
+    history entry and the editor show (none for a result with nothing to say)."""
+    d = explain.parse(detail)
+    if not d.reason and not d.message:
+        return []
+    values = {"message": d.message, "issues": d.params.get("issues", d.message), **d.params}
+    if d.reason.startswith("query_"):
+        why, fix = _say(ui, f"err_query_{d.reason[6:]}", values), ""
+    else:
+        why, fix = _say(ui, f"why_{d.reason}", values), _say(ui, f"fix_{d.reason}", values)
+    why = why or d.message or d.reason
+    lines = [ui.t("why_label").format(text=why)]
+    if d.node:
+        block = ui.t(_BLOCK_KEYS[d.node_kind]) if d.node_kind in _BLOCK_KEYS else d.node
+        lines.append(ui.t("where_label").format(text=ui.t("where_block").format(block=block, id=d.node)))
+    if fix:
+        lines.append(ui.t("fix_label").format(text=fix))
+    return lines

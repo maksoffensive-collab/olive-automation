@@ -150,13 +150,13 @@ class ConditionResult:
         measured = self.observation.detail.get("confidence_measured", True) is not False
         return {"condition": self.condition.describe(), "kind": self.observation.kind,
                 "satisfied": self.satisfied, "found": self.found, "expected": self.condition.expected,
-                "confidence": round(self.confidence, 4) if measured else None,
+                "confidence": self.confidence if measured else None,       # never rounded up to a threshold
                 "center": None if center is None else (center.x, center.y),
                 "target": self.target_id, "detail": dict(self.observation.detail)}
 
 
 def evaluate(condition: Condition, context: ObservationContext, *, max_age_s: float = 0.0,
-             cancel: threading.Event | None = None) -> ConditionResult:
+             cancel: threading.Event | None = None, picked_on: tuple[int, int] | None = None) -> ConditionResult:
     """Answer one condition on the context's target. A fresh screenshot unless `max_age_s` allows reuse."""
     if not isinstance(condition, Condition):
         raise InvalidCondition("evaluate() needs a Condition.")
@@ -164,4 +164,5 @@ def evaluate(condition: Condition, context: ObservationContext, *, max_age_s: fl
         raise InvalidCondition("evaluate() needs the ObservationContext of the target being asked about.")
     check_cancel(cancel)
     # the run's own cancel goes along, so it can end an OCR read under way instead of waiting for it to finish
-    return ConditionResult(condition, context.observe(condition.query, max_age_s=max_age_s, cancel=cancel))
+    return ConditionResult(condition, context.observe(condition.query, max_age_s=max_age_s, cancel=cancel,
+                                                      picked_on=picked_on))

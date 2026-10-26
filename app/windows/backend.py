@@ -100,6 +100,11 @@ class WindowBackend(ABC):
         """The process that owns window `hwnd`, or None if it is not a window (read only)."""
         return None
 
+    def client_screen_rect(self, hwnd: int) -> tuple[int, int, int, int] | None:
+        """(left, top, width, height) of the window's client area on the screen, in physical pixels (read only);
+        None when it cannot be read. Where a picker lays its picture of the window exactly over it."""
+        return None
+
     def monitors(self) -> tuple[tuple[int, int, int, int], ...]:
         """(left, top, width, height) of each monitor, in the virtual screen's physical pixels. A backend that
         cannot tell monitors apart reports the whole virtual screen as one."""
@@ -169,6 +174,13 @@ class WindowInputBackend(ABC):
     @abstractmethod
     def post_char(self, hwnd: int, char: str) -> None:
         """Post ONE character message (a single printable BMP character) to that window."""
+
+    # ---- a run's window in front (the person's decision of 2026-10-25) ---------------------------------------------
+    def raise_window(self, hwnd: int, *, activate: bool) -> bool:
+        """Make the window seen: restored if it is minimised and raised to the top of the Z order, without taking the
+        keyboard focus -- or, with `activate`, also made the foreground window when Windows allows it. Sends no
+        input. Returns True when it was minimised or covered (it may need a moment to draw itself again)."""
+        return False
 
     # ---- the whole desktop (Full Windows): see the class docstring --------------------------------------------
     def window_at(self, screen_x: int, screen_y: int) -> int | None:

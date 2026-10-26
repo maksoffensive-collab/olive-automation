@@ -36,8 +36,9 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from app.decide import ConditionalMacro
-from app.decide.format import (ASSET_DIR_SUFFIX, ASSET_NAME, asset_dir_for, conditional_to_json, load_macro_file,
-                               referenced_assets, save_macro_file, summarize_macro_text, validate_macro)
+from app.decide.format import (ASSET_DIR_SUFFIX, ASSET_NAME, asset_dir_for, load_macro_file, referenced_assets,
+                               save_macro_file, script_text, summarize_macro_text, validate_macro)
+from app.decide import Script
 from app.playback.format import MacroFormatError, macro_to_json
 from app.playback.macro import Macro
 
@@ -45,7 +46,7 @@ SUFFIX = ".macro.json"
 MAX_SLUG = 60
 MAX_FOLDER = 60
 _FOLDER_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-AnyMacro = Macro | ConditionalMacro
+AnyMacro = Macro | ConditionalMacro | Script
 
 
 def _is_asset_folder(name: str) -> bool:
@@ -319,7 +320,7 @@ class MacroLibrary:
         if path.exists() and not overwrite:
             raise MacroExists(f"A macro named “{path.name[:-len(SUFFIX)]}” already exists.", "err_macro_exists",
                               name=path.name[:-len(SUFFIX)])
-        if isinstance(macro, ConditionalMacro):
+        if isinstance(macro, (ConditionalMacro, Script)):
             return self._save_v2(macro, path, overwrite)
         tmp_name = None
         try:
@@ -472,7 +473,7 @@ class MacroLibrary:
         tmp_name = None
         moved = linked = False
         try:
-            text = macro_to_json(renamed) if isinstance(renamed, Macro) else conditional_to_json(renamed)[0]
+            text = macro_to_json(renamed) if isinstance(renamed, Macro) else script_text(renamed)[0]
             fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix="save-", suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(text)

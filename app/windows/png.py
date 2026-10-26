@@ -1,4 +1,7 @@
-"""Minimal PNG encoder (8-bit RGB, no filtering) for captured windows. Standard library only."""
+"""Minimal PNG encoder (8-bit RGB, no filtering) for captured windows. Standard library only.
+
+The data is stored, not compressed (zlib level 0): a capture is decoded in this process at once and never written
+anywhere, and compressing a large screen took 0.1-0.4 s of every look (3440 x 1440) for nothing."""
 from __future__ import annotations
 
 import struct
@@ -21,5 +24,5 @@ def encode_rgb_png_from_bgra(bgra: bytes, width: int, height: int) -> bytes:
     stride = width * 3
     raw = b"".join(b"\x00" + bytes(rgb[y * stride:(y + 1) * stride]) for y in range(height))
     ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", zlib.compress(raw, 3))
+    return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", zlib.compress(raw, 0))
             + _chunk(b"IEND", b""))

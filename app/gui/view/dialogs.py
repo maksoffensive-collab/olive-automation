@@ -188,7 +188,7 @@ class ChooseTargets(Modal):
         self._chosen = tuple(chosen)
         self.rows: dict[str, dict] = {}
         for group, items in groups.items():
-            ttk.Label(inner, text=group, style="Head.TLabel").pack(anchor="w", pady=(12, 4))
+            ttk.Label(inner, text=fmt.group_label(ui, group), style="Head.TLabel").pack(anchor="w", pady=(12, 4))
             for entry in items:
                 self._row(inner, entry)
         if not single and entries:

@@ -13,6 +13,7 @@ moved or deleted, so entries never pile up for files that no longer exist.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 MAX_DESCRIPTION = 500
@@ -23,6 +24,7 @@ class MacroMeta:
         """`path=None` keeps everything in memory and never touches disk (tests, and any caller that has not
         decided where metadata should live)."""
         self.path = Path(path) if path is not None else None
+        self._unreadable = False                # there, but not read: kept as it is, never written over
         self._data: dict[str, dict] = self._read()
 
     # ---- storage ---------------------------------------------------------------------------------
@@ -31,19 +33,28 @@ class MacroMeta:
             return {}
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
         except (OSError, ValueError):
+            self._unreadable = True             # locked, or cut short: what it holds is not thrown away
             return {}
         if not isinstance(raw, dict):
+            self._unreadable = True
             return {}
         return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, dict)}
 
     def _write(self) -> None:
-        if self.path is None:
+        """The whole file, through a temporary file that then takes its place (a write cut short leaves the old
+        file whole). Not at all when the file is there but could not be read: this session keeps its changes in
+        memory only, rather than replace stars, descriptions and remembered targets it never saw."""
+        if self.path is None or self._unreadable:
             return
+        temporary = self.path.with_name(self.path.name + ".tmp")
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(self._data, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+            temporary.write_text(json.dumps(self._data, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
                                  encoding="utf-8")
+            os.replace(temporary, self.path)
         except OSError:
             pass
 
@@ -84,6 +95,16 @@ class MacroMeta:
 
     def set_description(self, key: str, text: str) -> None:
         self._set(key, "description", str(text).strip()[:MAX_DESCRIPTION], "")
+
+    # ---- the target it remembers (the person's list of 2026-10-25, item 12) -----------------------
+    def target(self, key: str) -> dict | None:
+        """What a macro or script remembers of the target it was made or last run on (`target_memory.Remembered`
+        as plain data), or None."""
+        value = self._entry(key).get("target")
+        return value if isinstance(value, dict) else None
+
+    def set_target(self, key: str, target: dict | None) -> None:
+        self._set(key, "target", dict(target) if target else None, None)
 
     # ---- keeping in step with the files -----------------------------------------------------------
     def rename_key(self, old: str, new: str) -> None:

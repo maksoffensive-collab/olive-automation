@@ -232,6 +232,52 @@ class AdbClientTests(unittest.TestCase):
         c2.start_server()
         self.assertEqual(runner2.calls[0][0][1:], ("start-server",))
 
+    def test_the_server_is_started_in_the_background_at_once_and_never_twice(self):
+        """2026-10-21 review: a start where a person waits (the window's thread, which also carries the emergency
+        stop) is never waited for -- it runs on a thread of its own, one at a time."""
+        import threading
+        import time
+        release = threading.Event()
+
+        def slow(args):
+            release.wait(5)
+            return result("")
+        c, runner = self.client(slow, allow_server_start=True)
+        c.running = False
+        began = time.monotonic()
+        self.assertTrue(c.start_server_soon())
+        self.assertFalse(c.start_server_soon())                          # one under way: not a second
+        self.assertLess(time.monotonic() - began, 0.5)
+        release.set()
+        c._starting.join(5)
+        self.assertEqual([call[1:] for call, _ in runner.calls], [("start-server",)])
+
+    def test_a_background_start_is_gated_and_does_nothing_when_not_needed(self):
+        c, runner = self.client(lambda a: result(""))
+        with self.assertRaises(SafetyViolation):
+            c.start_server_soon()
+        c, runner = self.client(lambda a: result(""), allow_server_start=True)
+        c.start_server_soon()                                             # running already
+        c._starting.join(5)
+        c.running = False
+        self.stop.trigger("test")                                         # stopped: no start
+        c.start_server_soon()
+        c._starting.join(5)
+        self.assertEqual(runner.calls, [])
+
+    def test_a_background_start_that_fails_is_logged_and_raises_nothing(self):
+        mem = MemorySink()
+        c, runner = self.client(lambda a: result("", "boom", 1), allow_server_start=True,
+                                logger=LogHub([mem]).logger("adb"))
+        c.running = False
+        c.start_server_soon()
+        c._starting.join(5)
+        self.assertEqual(len(runner.calls), 1)
+        self.assertTrue(mem.query(operation="ADB_START_SERVER"))
+        reason = c.take_start_failure()
+        self.assertIn("boom", reason)
+        self.assertIsNone(c.take_start_failure())                          # said once: the next choice tries again
+
     def test_every_command_gets_a_timeout(self):
         c, runner = self.client(lambda a: result("List of devices attached\n\n"))
         c.list_devices()

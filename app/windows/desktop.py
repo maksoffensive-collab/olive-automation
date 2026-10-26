@@ -44,6 +44,12 @@ from app.windows.input import IntendedInput, InputRefused, WindowInputSession, _
 from app.windows.target import FullWindowsTarget, screen_layout
 
 VK_ESCAPE = 0x1B
+
+
+class PlaceCovered(InputRefused):
+    """A press of a Full Windows recording would land on another window than the one it was recorded in."""
+    reason_code = "place_covered"
+
 TAKEOVER_DISTANCE = 24     # pixels the person's own mouse may drift (a bump of the desk) before it counts as taking over
 DRIFT_FORGET_S = 1.0       # the person's small movements are forgotten after this long without any
 WATCH_GRACE_S = 1.0        # an event the run sent must be seen by the watch within this long
@@ -63,6 +69,14 @@ class DesktopInputSession(WindowInputSession):
         self._own_pid = os.getpid() if own_pid is None else own_pid
         self._watch = watch                      # the run's watch: told of every send, so it notices going blind
         self._call = threading.local()           # what the current call on this thread is (a key release or not)
+
+    def expect_window(self, hwnd: int) -> None:
+        """The NEXT pointer operation's presses must land in window `hwnd` (a Full Windows recording played click by
+        click in the window each click was in, app/windows/places.py): checked at the point right before each of
+        its phases -- a phase begins with a press: a click's, or a double click's second -- and refused when
+        another window is on top there. A release within a phase is not checked again: it presses nothing (the
+        person's decision of 2026-10-26)."""
+        self._call.expected = hwnd
 
     @staticmethod
     def _check_target(target: Target) -> None:
@@ -86,7 +100,11 @@ class DesktopInputSession(WindowInputSession):
         left, top = self._target.layout[0], self._target.layout[1]
         phases = [[self._noting(e, lambda e=e: self._backend.desktop_mouse(e, left + x, top + y)) for e in phase]
                   for phase in events]
-        self._execute(IntendedInput(self.provider_id, self.target_id, action, x, y), (x, y), phases, after)
+        self._call.check_window, self._call.expected = getattr(self._call, "expected", None), None   # its first gate
+        try:
+            self._execute(IntendedInput(self.provider_id, self.target_id, action, x, y), (x, y), phases, after)
+        finally:
+            self._call.check_window = None
 
     def _keyboard(self, capability: Capability, action: str, key: Key, events: list[list[tuple[KeyEvent, Key]]], *,
                   after: Callable[[], None] | None = None) -> None:
@@ -130,6 +148,11 @@ class DesktopInputSession(WindowInputSession):
             if hit is None:
                 raise InputRefused(f"No window is at ({x}, {y}); nothing sent.")
             self._refuse_unless_foreign(hit, f"({x}, {y}) is on Olive Automation's own window")
+            expected = getattr(self._call, "check_window", None)
+            if expected is not None:
+                if hit != expected:
+                    raise PlaceCovered("Another window is on top of the click's window at that point; nothing "
+                                       "sent.")
         elif not getattr(self._call, "releasing", False):
             # a key release presses nothing (and Olive reacts to none), so it may go wherever the focus is: refusing
             # it would only leave the key held for the whole desktop

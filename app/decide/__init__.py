@@ -15,6 +15,8 @@ device or recognition engine is behind the target. A branch is expressed as the 
 there is no second action model and no second playback path.
 
     format.py            macro files: v1 unchanged (delegated to app.playback.format), v2 adds these steps
+    graph.py             version-4 scripts: blocks joined by arrows (the person's design of 2026-10-25)
+    graph_format.py      their files            graph_run.py   their runs, along the arrows
 """
 from .condition import Condition, ConditionResult, evaluate
 from .decision import (ELSE, MAX_NESTING, THEN, Choice, Decision, RunMacro, TapMatch, count_blocks, decide, tap_macro,
@@ -25,6 +27,13 @@ from .position import MAX_POSITION
 from .run import (MAX_BLOCKS, MAX_START_DELAY_S, MAX_STEPS, FlowReport, FlowState, StepReport, act, adapting,
                   run_steps)
 from .wait import WaitResult, WaitStatus, WaitUntil, wait_until
+from . import graph
+from .graph import (AGAIN, ALL, ANY, AT_MATCH, AT_POINT, CHECK, CLICK, CLICK_KINDS, DONE, DOUBLE, DRAG, FOR, FOUND,
+                    HOLD, MACRO, MANUAL, MAX_PARTS, MISSING, NEXT, PICTURE, PIXEL, REPEAT, REPEAT_MODES, RIGHT, START,
+                    STOP, TAP, TEXT, TIMES, UNTIL, WAIT, CheckNode, ClickNode, Edge, GraphError, MacroNode, Node, Part,
+                    RepeatNode, Script, StartNode, StopNode, WaitNode, part_kind)
+from .graph_format import script_from_json, script_to_json, validate_script
+from .graph_run import CANCELLED, COMPLETED, ENTER, ERROR, FAILED, LEAVE, GraphReport, run_graph
 
 __all__ = [
     "adapting",
@@ -35,4 +44,11 @@ __all__ = [
     "run_steps", "act", "FlowReport", "FlowState", "StepReport", "MAX_STEPS", "MAX_BLOCKS", "MAX_START_DELAY_S",
     "ConditionalMacro", "load_macro_file", "save_macro_file", "migrate_v1",
     "DecisionError", "InvalidCondition", "InvalidDecision", "Cancelled",
+    # version 4
+    "graph", "Script", "Node", "Edge", "Part", "GraphError", "part_kind", "StartNode", "WaitNode", "CheckNode",
+    "RepeatNode", "ClickNode", "MacroNode", "StopNode", "START", "WAIT", "CHECK", "REPEAT", "CLICK", "MACRO", "STOP",
+    "NEXT", "FOUND", "MISSING", "AGAIN", "DONE", "ANY", "ALL", "MANUAL", "UNTIL", "FOR", "TIMES", "REPEAT_MODES",
+    "TAP", "DOUBLE", "RIGHT", "HOLD", "DRAG", "CLICK_KINDS", "AT_POINT", "AT_MATCH", "PIXEL", "PICTURE", "TEXT",
+    "MAX_PARTS", "script_from_json", "script_to_json", "validate_script", "run_graph", "GraphReport", "COMPLETED",
+    "FAILED", "CANCELLED", "ENTER", "LEAVE", "ERROR",
 ]

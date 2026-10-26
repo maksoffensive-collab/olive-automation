@@ -332,6 +332,15 @@ class ScreenshotProviderRules(unittest.TestCase):
             with self.assertRaises(ValueError):
                 encode_rgb_png_from_bgra(data, w, h)
 
+    def test_a_capture_is_stored_not_compressed(self):
+        """2026-10-21: compressing took 0.1-0.4 s of every look at a large screen; the PNG never leaves memory."""
+        import struct
+        png = encode_rgb_png_from_bgra(bytes(range(256)) * 64, 64, 64)
+        length = struct.unpack(">I", png[33:37])[0]
+        self.assertEqual(png[37:41], b"IDAT")
+        self.assertEqual(png[41:43], b"\x78\x01")                       # zlib, level 0: stored blocks
+        self.assertGreater(length, 64 * 64 * 3)
+
 
 def imports_of(path: Path) -> set[str]:
     out = set()
@@ -399,25 +408,26 @@ class Isolation(unittest.TestCase):
             self.assertTrue(any(lo < pos < hi for lo, hi in zip(bounds, bounds[1:])),
                             "every SendInput call must live inside one of the three known sending methods")
 
-    def test_setforegroundwindow_is_confined_to_one_call_site(self):
+    def test_setforegroundwindow_is_confined_to_two_call_sites(self):
         # SetForegroundWindow changes system-wide focus -- the most invasive API this module uses. It exists
-        # only because real keyboard input needs the target to actually hold focus, unlike a real click, and
-        # must stay confined to exactly one file, one binding and one call site, immediately followed by a
-        # re-check that it actually worked (see _ensure_real_focus) -- never used for mouse, and never assumed
-        # to succeed.
+        # because real keyboard input needs the target to actually hold focus, unlike a real click: there it is
+        # immediately followed by a re-check that it actually worked (see _ensure_real_focus) and never assumed to
+        # succeed. On the person's decision of 2026-10-25 a run also makes its window the main one when it starts
+        # (`raise_window` with `activate`, sending nothing): nothing relies on that succeeding -- a click is
+        # hit-tested and a key goes through _ensure_real_focus as before. One file, one binding, those two places.
         for path in (ROOT / "windows").glob("*.py"):
             text = path.read_text(encoding="utf-8")
             if path.name != "win32.py":
                 self.assertNotIn("SetForegroundWindow", text, path.name)
         text = (ROOT / "windows" / "win32.py").read_text(encoding="utf-8")
         self.assertEqual(text.count("u.SetForegroundWindow"), 1)          # exactly one API binding
-        self.assertEqual(text.count("self._SetForegroundWindow("), 1)     # exactly one call site
-        self.assertIn("def _ensure_real_focus(", text)
-        call_at = text.index("self._SetForegroundWindow(")
-        method_at = text.index("def _ensure_real_focus(")
-        next_def = text.index("\n    def ", method_at + 1)
-        self.assertTrue(method_at < call_at < next_def,
-                        "the SetForegroundWindow call must live inside _ensure_real_focus")
+        self.assertEqual(text.count("self._SetForegroundWindow("), 2)     # exactly two call sites
+        bodies = {}
+        for name in ("_ensure_real_focus", "raise_window"):
+            start = text.index(f"def {name}(")
+            bodies[name] = text[start:text.index("\n    def ", start + 1)]
+            self.assertEqual(bodies[name].count("self._SetForegroundWindow("), 1, f"one call inside {name}")
+        self.assertIn("if activate:", bodies["raise_window"].split("self._SetForegroundWindow(")[0])   # only if asked
 
     def test_observation_reads_exist_only_inside_win32(self):
         # The recorder needs to read which window is under the pointer / has focus and to install pass-through hooks.

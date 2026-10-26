@@ -34,7 +34,8 @@ class Roi:
         """Return self if the ROI lies completely inside a width x height image, else raise."""
         if self.right > width or self.bottom > height:
             raise VisionError(f"ROI {self.width}x{self.height} at ({self.x}, {self.y}) is outside the "
-                              f"{width}x{height} image.")
+                              f"{width}x{height} image.", code="area_outside_image",
+                              area=f"{self.width}×{self.height}", x=self.x, y=self.y, image=f"{width}×{height}")
         return self
 
     def contains(self, x: int, y: int) -> bool:

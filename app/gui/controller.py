@@ -50,9 +50,10 @@ from typing import Callable, Generic, TypeVar
 
 from app.core.errors import (CapabilityNotAvailable, EmergencyStopped, PlatformError,
                              TargetNotVerified)
-from app.decide import Cancelled, Condition, ConditionalMacro, ConditionResult, evaluate, migrate_v1
-from app.gui import flow_edit, flows
-from app.gui import formatting
+from app.decide import (Cancelled, Condition, ConditionalMacro, ConditionResult, MacroNode, Script, evaluate,
+                        migrate_v1)
+from app.gui import flow_edit, flows, graph_edit, target_memory
+from app.gui import explain, formatting
 from app.gui import history as run_history
 from app.gui import macro_edit
 from app.gui.history import RunHistory, TargetResult
@@ -60,7 +61,7 @@ from app.gui.library import LibraryError, MacroExists, MacroInfo, MacroLibrary, 
 from app.gui.macro_list import Filter, Scope, Sort, counts, visible
 from app.gui.meta import MacroMeta
 from app.gui.services import AutomationServices, TargetEntry
-from app.observe import (InvalidQuery, ObservationCancelled, ObservationContext, ObservationUnavailable,
+from app.observe import (QUERY_CODES, InvalidQuery, ObservationCancelled, ObservationContext, ObservationUnavailable,
                          OcrLanguageUnavailable, OcrProvider, OcrResult, OcrUnavailable, TextQuery,
                          applies_text_confidence, check_text_reader, reader_languages)
 from app.playback.engine import (ExecutionReport, PlaybackEngine, PlaybackRefused, PlaybackState,
@@ -248,6 +249,23 @@ class Status:
         return dict(self.params)
 
 
+def _now_errors(report) -> list:
+    """A script's check of a macro before its first block: what is wrong with the macro now -- leaving out what an
+    earlier block may still change (`Issue.deferrable`: a window it clicks in, which an earlier block may open), which
+    that macro's own run checks when its turn comes (the independent review of 2026-10-26)."""
+    return [issue for issue in report.errors if not issue.deferrable]
+
+
+def _refusal_detail(issues, node: str | None = None) -> str:
+    """A refused run's detail: every issue, the names and numbers the first one's sentence needs, and the block
+    (`node`) whose recorded macro it is about."""
+    text = "; ".join(f"{i.code}: {i.message}" for i in issues)
+    first = issues[0]
+    if not (first.params or node):
+        return text
+    return explain.encode(first.code, node, dict(first.params), text.split(": ", 1)[1])
+
+
 def _listed_as(entry: TargetEntry) -> tuple:
     """What a list row says a target IS. Its size and running state may change between two discoveries; these may
     not: the same token with other values names another target."""
@@ -294,6 +312,14 @@ class TargetRun:
     starts_in: int = 0         # whole seconds left of a script's start delay (0: none, or its steps have begun)
 
 
+def _start_delay(macro) -> float:
+    """The start delay of a script of any version (0 for a recorded macro)."""
+    if isinstance(macro, Script):
+        return float(macro.start.delay_s)
+    if isinstance(macro, ConditionalMacro):
+        return float(macro.start_delay_s)
+    return 0.0
+
 class AppController:
     def __init__(self, services: AutomationServices, library: MacroLibrary, *,
                  meta: MacroMeta | None = None, history: RunHistory | None = None,
@@ -319,6 +345,8 @@ class AppController:
         self.text_languages_state = LANGS_NONE if ocr is None else LANGS_IDLE
         self.text_languages_detail = ""
         self.probe_status: Status | None = None             # what the latest probe's own answer said
+        self._escape = None                                # Esc anywhere, while a run is on (or None)
+        self._activating = False                           # True only while Run's own press starts targets
         self.meta = meta if meta is not None else MacroMeta(None)
         self.history = history if history is not None else RunHistory(None)
         self.version = 0                                   # bumped on every visible change; the view re-renders
@@ -370,7 +398,9 @@ class AppController:
         self.run_macro_name = ""
         self.run_macro_key = ""
         self._run_queue: list[str] = []
-        self._running: dict[str, PlaybackEngine | flows.FlowJob] = {}   # ref -> its own engine / job and thread
+        self._running: dict[str, PlaybackEngine | flows.FlowJob | flows.GraphJob] = {}   # ref -> its engine / job
+        self._graph_macros: dict[str, Macro] = {}          # the recorded macros a v4 run's blocks name, by key
+        self._lit_job: flows.GraphJob | None = None        # the v4 job whose blocks the editor lights
         self._run_flow: ConditionalMacro | None = None     # the v2 macro of the current run (None: a v1 run)
         self.concurrency = DEFAULT_CONCURRENCY
         self._run_started = 0.0
@@ -414,6 +444,9 @@ class AppController:
             return self._fail("unsupported", "This action is not available for the selected target.", exc, key="msg_unsupported")
         if isinstance(exc, TargetNotVerified):
             return self._fail(category, str(exc), exc)
+        if getattr(exc, "code", "") in QUERY_CODES:
+            # a refusal of a search (a picture larger than its area, ...): said in the person's language, with a fix
+            return self._fail(category, str(exc), exc, key=f"err_query_{exc.code}", **getattr(exc, "params", {}))
         if isinstance(exc, (RecorderStateError, PlaybackStateError, LibraryError, PlatformError)):
             return self._fail(category, str(exc), exc)
         if isinstance(exc, SizeChanged):
@@ -485,6 +518,9 @@ class AppController:
         except Exception as exc:
             return self._explain(exc, "discovery")
         dropped = self._keep_targets_still_listed(before)
+        shown = self.macro_by_key(self.selected_key) if self.selected_key else None
+        if shown is not None and not self.run_refs and self._targets_again(shown):
+            dropped = False                       # the shown macro's remembered targets, listed now (item 12)
         stale_note = stale_reason = ""
         if self.target is not None and self.target_status is TargetStatus.VERIFIED:
             try:
@@ -1125,6 +1161,8 @@ class AppController:
                 self.previous_run_refs, choice = choice.refs, None
             # this macro's own earlier choice, if it has one -- chosen explicitly FOR it, and shown before Run
             self.run_refs, self.run_refs_key = (choice.refs, self.selected_key) if choice else ((), "")
+            if choice is None and info is not None:
+                self._targets_again(info)
         self._touch()
         return info is not None
 
@@ -1231,7 +1269,11 @@ class AppController:
         follow its new key. `before` is the stamp of its file just before the move: run targets chosen for that very
         version, and an editor opened on it, follow the file; any chosen or opened for an older one do not."""
         new_key = self.library.key_of(path)
+        memory = self.meta.target(info.key)
+        holds = isinstance(memory, dict) and before is not None and memory.get("file") == list(before)
         self.meta.rename_key(info.key, new_key)
+        if holds:
+            self._restamp_memory(new_key, path, was=before)   # the remembered targets follow the very version moved
         self.history.rename_key(info.key, new_key)
         if self.macro_path is not None and Path(info.path).resolve() == self.macro_path.resolve():
             self.macro_path = path
@@ -1387,18 +1429,61 @@ class AppController:
         stamp = file_stamp(info.path)                # BEFORE the read: a change after it is seen, never hidden
         try:
             macro = self.library.load(info.path)
-            self.editor = (flow_edit.FlowSession(macro) if isinstance(macro, ConditionalMacro)
-                           else macro_edit.EditSession(macro))
+            if isinstance(macro, Script):
+                self.editor = graph_edit.GraphSession(macro)
+            elif isinstance(macro, ConditionalMacro):
+                self.editor = flow_edit.FlowSession(macro)
+            else:
+                self.editor = macro_edit.EditSession(macro)
         except macro_edit.EditError as exc:
             return self._fail("editor", str(exc), exc)
         except Exception as exc:
             return self._explain(exc, "storage")
         self.editor_key, self.editor_stamp = info.key, stamp
+        if isinstance(macro, Script):
+            refs = self.remembered_refs(info.key)
+            if len(refs) == 1 and (self.selected is None or self.selected.ref != refs[0] or not self.target_ready):
+                return self._edit_on_remembered(macro.name, refs[0])
         return self._say("info", "editor", f"Editing “{macro.name}”.", key="msg_editing", name=macro.name)
+
+    def _edit_on_remembered(self, name: str, ref: str) -> bool:
+        """A script opened in the editor works on the target it remembers (item 12), verified as any choice --
+        and the person is told, never switched silently. When it does not verify, the target chosen before (if
+        any) is chosen again and the person is told why."""
+        before = self.selected.ref if self.selected is not None and self.target_ready else None
+        label = next((e.title or e.process for e in self.entries if e.ref == ref), ref)
+        if self.select(ref):
+            return self._say("info", "editor", f"Editing “{name}” on its target “{label}”.",
+                             key="msg_editing_on_target", name=name, target=label)
+        reason = self.status.text
+        if before is not None:
+            self.select(before)
+        return self._say("warn", "editor", f"Editing “{name}”. Its target “{label}” could not be verified: "
+                                           f"{reason}", key="msg_editing_target_unverified", name=name,
+                         target=label, reason=reason)
 
     @property
     def editing_v2(self) -> bool:
         return isinstance(self.editor, flow_edit.FlowSession)
+
+    @property
+    def editing_graph(self) -> bool:
+        """A version-4 script (blocks joined by arrows) is open in the editor."""
+        return isinstance(self.editor, graph_edit.GraphSession)
+
+    def editor_apply_graph(self, edit, *args, **kwargs):
+        """One edit of the version-4 script in the editor; what it returns besides the script (a new block's id),
+        or None. A refused edit changes nothing and explains itself."""
+        if not self.editing_graph:
+            self._fail("editor", "No script is open.", key="msg_no_editor")
+            return None
+        try:
+            extra = self.editor.apply(edit, *args, **kwargs)
+        except macro_edit.EditError as exc:
+            self._fail("editor", str(exc), exc)
+            return None
+        self._touch()
+        return extra if extra is not None else True
 
     def editor_apply(self, edit, *args, **kwargs) -> bool:
         """Run one pure edit from app/gui/macro_edit.py. A refused edit changes nothing and explains itself."""
@@ -1433,7 +1518,7 @@ class AppController:
         if self.busy:
             return self._fail("busy", "Wait until the recording or run has finished.", key="msg_busy_wait")
         try:
-            draft = flow_edit.new_script(name)
+            draft = graph_edit.new_script(name.strip())
             taken = self.library.path_for(draft.name, folder).exists()
         except macro_edit.EditError as exc:
             return self._fail("editor", str(exc), exc)
@@ -1444,7 +1529,7 @@ class AppController:
             # share one folder, and the Scripts page does not list recordings)
             exc = MacroExists(f"A macro named “{draft.name}” already exists.", "err_macro_exists", name=draft.name)
             return self._fail("exists", str(exc), exc)
-        self.editor, self.editor_key, self.editor_folder = flow_edit.FlowSession(draft), "", folder
+        self.editor, self.editor_key, self.editor_folder = graph_edit.GraphSession(draft), "", folder
         self.editor_stamp = None
         return self._say("info", "editor", f"New script “{draft.name}”: add its first step.", key="msg_script_new",
                          name=draft.name)
@@ -1501,6 +1586,7 @@ class AppController:
             return self._explain(exc, "storage")
         self.editor.mark_saved()
         self.editor_key, self.editor_stamp = self.library.key_of(path), file_stamp(path)
+        self.remember_target_for(self.editor_key, path)    # made on it: remembered with it (item 12)
         self.refresh_macros()
         self.select_macro(self.editor_key)
         return self._say("ok", "saved", f"Saved “{macro.name}”.", key="msg_saved", name=macro.name)
@@ -1521,14 +1607,15 @@ class AppController:
             self.refresh_macros()                          # (targets the file no longer fits are dropped by it)
             return self._say("info", "saved", f"“{name}” has no unsaved changes.", key="msg_saved_unchanged",
                              name=name)
-        if file_stamp(info.path) != self.editor_stamp and not replace_outside:
+        opened = self.editor_stamp                         # the version the editor's content comes from
+        if file_stamp(info.path) != opened and not replace_outside:
             return self._fail("changed_outside", f"“{name}” was changed outside this application after it was "
                                                  "opened here; saving would replace that change.",
                               key="msg_editor_changed_outside", name=name)
         try:
             macro = self.editor.macro()
             path = self.library.save_over(macro, info.path)     # the file being edited, never one of the same name
-            if isinstance(macro, ConditionalMacro) and self.library.load(path) != macro:
+            if isinstance(macro, (ConditionalMacro, Script)) and self.library.load(path) != macro:
                 # read back from disk, templates included and hash-checked: what was saved is what will run
                 return self._fail("storage", "The saved macro did not read back as it was saved.",
                                   key="msg_saved_mismatch")
@@ -1538,8 +1625,13 @@ class AppController:
             return self._explain(exc, "storage")
         self.editor.mark_saved()
         self.editor_stamp = file_stamp(path)
-        cleared = self._forget_targets_of(self.library.key_of(path))    # it does something else now
+        key = self.library.key_of(path)
+        self._restamp_memory(key, path, was=opened)   # Olive wrote it from the version remembered for: still holds
+        cleared = self._forget_targets_of(key)    # it does something else now: the session's choice is not kept ...
         self.refresh_macros()
+        info = self.macro_by_key(key)
+        if cleared and info is not None and self._targets_again(info):
+            cleared = False                       # ... but the targets it remembers are found again (item 12)
         if isinstance(macro, Macro) and self.macro_path is not None \
                 and info.path.resolve() == self.macro_path.resolve():
             self.macro, self.unsaved = macro, False         # the copy held for playback follows the file
@@ -1573,13 +1665,93 @@ class AppController:
                                                          "Check it, then choose its run targets again.",
                                       key="msg_run_targets_look_again", name=info.name)
                 self._targets_of[self.selected_key] = _Choice(chosen, stamp)   # FOR this macro and this version
+                self._remember_targets(self.selected_key, chosen)
             else:
                 self._targets_of.pop(self.selected_key, None)
+                self.meta.set_target(self.selected_key, None)   # none, on purpose: nothing brought back either
         if chosen != self.run_refs or self.run_refs_key != self.selected_key or self.previous_run_refs:
             self.run_refs, self.run_refs_key = chosen, self.selected_key     # chosen for THIS macro
             self.previous_run_refs = ()                                      # a choice was made: no suggestion left
             self._touch()
         return True
+
+    # ---- the targets a macro remembers (the person's list of 2026-10-25, item 12) -------------------------------
+    def _remember_targets(self, key: str, refs, path: Path | None = None) -> None:
+        """What a person would recognise each chosen target by, kept with the macro (the library's metadata), so it
+        is found again next time -- after the program, or Olive, was started again -- together with the version of
+        the file it was remembered for: a file changed OUTSIDE Olive (replaced by another macro, say) does not
+        inherit it."""
+        entries = [entry for entry in map(self._entry_of, refs) if entry is not None]
+        if path is None:
+            info = self.macro_by_key(key) if key else None
+            path = info.path if info is not None else None
+        if path is not None and entries:
+            stamp = file_stamp(path)
+            self.meta.set_target(key, {"targets": [target_memory.remember(e).as_dict() for e in entries],
+                                       "file": list(stamp) if stamp is not None else None})
+
+    def _restamp_memory(self, key: str, path: Path, *, was: tuple | None) -> None:
+        """Olive itself has just written `key`'s file from the version stamped `was`: what it remembers holds for the
+        new version too -- only when it was remembered for that very version (one replaced outside Olive since keeps
+        its old stamp, so the new version does not inherit it either; the independent review of 2026-10-26)."""
+        data = self.meta.target(key)
+        stamp = file_stamp(path)
+        if isinstance(data, dict) and stamp is not None and was is not None and data.get("file") == list(was):
+            self.meta.set_target(key, dict(data, file=list(stamp)))
+
+    def _memory_of(self, key: str) -> list:
+        """What `key` remembers -- for the version of its file there is now, else nothing."""
+        data = self.meta.target(key) if key else None
+        raw = data.get("targets") if isinstance(data, dict) else None
+        if not isinstance(raw, list) or not raw:
+            return []
+        info = self.macro_by_key(key)
+        stamp = file_stamp(info.path) if info is not None else None
+        if stamp is None or data.get("file") != list(stamp):
+            return []                             # changed outside Olive since: not trusted, the person is asked
+        return [target_memory.Remembered.from_dict(item) for item in raw]
+
+    def _each_found(self, memories, how) -> tuple[str, ...]:
+        found = [how(memory, self.entries) for memory in memories]
+        refs = [entry.ref for entry in found if entry is not None]
+        if not memories or len(refs) != len(memories) or len(set(refs)) != len(refs):
+            return ()                             # one missing, or two remembered ones on one listed target
+        return tuple(refs)
+
+    def remembered_refs(self, key: str) -> tuple[str, ...]:
+        """The listed targets the macro `key` remembers, each found again (`target_memory.find`); () when any of
+        them is not there or cannot be told apart, or two of them come out as one -- then nothing is chosen."""
+        return self._each_found(self._memory_of(key), target_memory.find)
+
+    def remembered_suggestion(self, key: str) -> tuple[str, ...]:
+        """When `remembered_refs` finds nothing: the listed targets that only look like the remembered ones (the
+        same program and kind, another title), to offer pre-ticked for one confirmation -- never chosen by
+        themselves (`target_memory.suggestion`)."""
+        memories = self._memory_of(key)
+        if self._each_found(memories, target_memory.find):
+            return ()
+        return self._each_found(memories, lambda m, entries: target_memory.find(m, entries)
+                                or target_memory.suggestion(m, entries))
+
+    def _targets_again(self, info: MacroInfo) -> bool:
+        """The macro's remembered targets as its run targets, for the version of its file there is now, when every
+        one is found again. True when they were."""
+        refs = self.remembered_refs(info.key)
+        if not refs:
+            offered = self.remembered_suggestion(info.key)
+            if offered and self.selected_key == info.key and not self.run_refs:
+                self.previous_run_refs = offered  # pre-ticked in the picker: the person confirms, or not
+            return False
+        self._targets_of[info.key] = _Choice(refs, file_stamp(info.path))
+        if self.selected_key == info.key:
+            self.run_refs, self.run_refs_key, self.previous_run_refs = refs, info.key, ()
+        return True
+
+    def remember_target_for(self, key: str, path: Path) -> None:
+        """The chosen target remembered for `key` at `path` (a macro just recorded on it, a script just made on
+        it)."""
+        if key and self.target_ready and self.selected is not None:
+            self._remember_targets(key, [self.selected.ref], path)
 
     def _forget_targets_of(self, key: str) -> bool:
         """The content of macro `key` was just replaced. Targets chosen for what it USED to do are not trusted for
@@ -1682,13 +1854,47 @@ class AppController:
             macro = self.library.load(info.path)
         except Exception as exc:
             return self._explain(exc, "storage")
-        if isinstance(macro, ConditionalMacro):
+        self._graph_macros = {}
+        if isinstance(macro, Script):
+            # v4: each target runs the drawing as a GraphJob; the recorded macros its macro blocks name are read
+            # once, here (one that is gone refuses the targets before anything is done)
+            self._run_flow = macro
+            for node in macro.nodes:
+                if isinstance(node, MacroNode) and node.macro and node.macro not in self._graph_macros:
+                    found = self.macro_by_key(node.macro)
+                    try:
+                        loaded = self.library.load(found.path) if found is not None else None
+                    except LibraryError:
+                        loaded = None
+                    if isinstance(loaded, Macro):
+                        # a macro that knows its size follows the target's size, as in a script before (other
+                        # proportions refused by its preflight, before anything is sent); one that does not is
+                        # played as recorded
+                        if loaded.recording.size is not None and not loaded.adapt:
+                            loaded = replace(loaded, adapt=True)
+                        self._graph_macros[node.macro] = loaded
+        elif isinstance(macro, ConditionalMacro):
             self._run_flow = macro                          # v2: each target runs the steps as a FlowJob
             size = len(macro.steps)
         else:
             self._run_flow = None
             self.macro, self.macro_path, self.unsaved = macro, info.path, False
             size = len(macro.actions)
+        if isinstance(macro, Script):
+            size = len(macro.nodes)
+        # Esc anywhere stops a run, a dry run too (the person's decision of 2026-10-25): the run brings its targets'
+        # windows to the front, so this window -- its Stop button, its Esc -- ends up behind them. No watch, no run.
+        # A run that waits to start first starts it when it begins to act (FlowJob's `on_acting`): nothing watches
+        # the keyboard during the delay, and an Esc typed meanwhile elsewhere cancels nothing.
+        watch = self.services.escape_watch([e for e in map(self._entry_of, self.run_refs) if e is not None])
+        delayed = _start_delay(macro) > 0 and not dry_run
+        if watch is not None and not delayed:
+            try:
+                watch.start()
+            except Exception as exc:
+                return self._fail("playback", f"Esc anywhere could not be set up to stop this run, so it was not "
+                                              f"started: {exc}", exc, key="msg_escape_unavailable", reason=str(exc))
+        self._escape = watch
         self.preflight_lines, self.dry_run_lines, self.last_report = [], [], None
         titles = {e.ref: (e.title or e.process) for e in self.entries}
         self.run_results = tuple(TargetRun(ref, titles.get(ref, ref), RunState.WAITING) for ref in self.run_refs)
@@ -1699,13 +1905,19 @@ class AppController:
         self._run_started, self._run_actions = self._clock(), size
         # a script's start delay is the RUN's, waited once (the person's decision of 2026-10-20): a target that starts
         # later waits only what is left of it, so targets run one after another do not each wait it again
-        delay = float(macro.start_delay_s) if isinstance(macro, ConditionalMacro) and not dry_run else 0.0
+        delay = _start_delay(macro) if not dry_run else 0.0
         self._run_delay, self._run_noticed = delay, False
         self._say("info", "playback", ("Dry run of “" if dry_run else "Running “") + self.run_macro_name
                   + f"” on {len(self.run_refs)} target(s).",
                   key="msg_dry_started" if dry_run else "msg_run_started", name=self.run_macro_name,
                   count=len(self.run_refs))
-        self._advance_run()
+        # the targets that start now are made the main window: the person has just pressed Run, so Olive holds the
+        # focus and may pass it on; a target that starts later (after another) is only raised, never given the focus
+        self._activating = True
+        try:
+            self._advance_run()
+        finally:
+            self._activating = False
         return True
 
     def _set_run_result(self, ref: str, state: RunState, *, completed: int = 0, total: int = 0,
@@ -1759,6 +1971,9 @@ class AppController:
         verified identity."""
         try:
             target = self.services.verify(entry)
+        except EmergencyStopped:
+            self._set_run_result(ref, RunState.STOPPED, detail="emergency_stop")      # a stop is a stop, never a refusal
+            return
         except Exception as exc:
             self._set_run_result(ref, RunState.REFUSED, detail=f"{type(exc).__name__}: {exc}")
             self._log(f"[run] {ref}: not verified ({exc})")
@@ -1768,13 +1983,15 @@ class AppController:
         if target.provider_id != self.macro.target.provider_id:
             self._set_run_result(ref, RunState.REFUSED, detail=f"recorded for {self.macro.target.provider_id}")
             return
+        if self._fronted(ref, target) is None:
+            return
         different = target.target_id != self.macro.target.target_id
         try:
             engine = self.services.create_playback(self.macro, target, dry_run=self.run_dry,
                                                    allow_different_target=different)
             report = engine.preflight()
             if not report.ok:
-                detail = "; ".join(f"{i.code}: {i.message}" for i in report.errors)
+                detail = _refusal_detail(report.errors)
                 self.preflight_lines = [f"{i.severity} {i.code}: {i.message}" for i in report.issues]
                 self._set_run_result(ref, RunState.REFUSED, total=self._run_actions, detail=detail)
                 return
@@ -1787,21 +2004,40 @@ class AppController:
         self.playback = PlaybackView(True, self.run_dry, PlaybackState.RUNNING.value, self.run_macro_name,
                                      0, self._run_actions)
 
+    def _fronted(self, ref: str, target: Target) -> bool | None:
+        """The target's window in front before anything is checked or looked at (the person's decision of
+        2026-10-25): restored if minimised, raised over what covers it -- and made the main window when the run has
+        just been started (`_activating`). True when it was hidden or covered; None when the target is refused (or
+        the run stopped), which is then its result."""
+        try:
+            return self.services.bring_to_front(target, activate=self._activating)
+        except EmergencyStopped:
+            self._set_run_result(ref, RunState.STOPPED, detail="emergency_stop")
+        except Exception as exc:
+            self._set_run_result(ref, RunState.REFUSED, detail=f"{type(exc).__name__}: {exc}")
+        return None
+
     def _start_flow(self, ref: str, target: Target) -> None:
         """One target of a v2 run: the checks a v1 target gets, made before anything is observed -- what the target
         declares it can do, and preflight of every recorded macro the steps may run -- then its own `FlowJob`."""
         flow = self._run_flow
+        if isinstance(flow, Script):
+            return self._start_graph(ref, target, flow)
         problem = flows.refusal(flow, target)
         if problem:
             self._set_run_result(ref, RunState.REFUSED, total=self._run_actions, detail=problem)
             return
         different = flows.allow_different(flow, target)      # the explicit choice of targets, never the file
+        uncovered = self._fronted(ref, target)
+        if uncovered is None:
+            return
         try:
             for macro in flows.recorded_macros(flow):
                 report = self.services.create_playback(macro, target, dry_run=self.run_dry,
                                                        allow_different_target=different).preflight()
-                if not report.ok:
-                    detail = "; ".join(f"{i.code}: {i.message}" for i in report.errors)
+                errors = _now_errors(report)
+                if errors:
+                    detail = _refusal_detail(errors)
                     self.preflight_lines = [f"{i.severity} {i.code}: {i.message}" for i in report.issues]
                     self._set_run_result(ref, RunState.REFUSED, total=self._run_actions, detail=detail)
                     return
@@ -1809,7 +2045,8 @@ class AppController:
             # clock read at the same moment, can come out a hair above it in floating point)
             delay = 0.0 if self.run_dry else max(0.0, self._run_delay - (self._clock() - self._run_started))
             job = flows.FlowJob(flow, target, self.services, ocr=self.ocr, dry_run=self.run_dry,
-                                allow_different_target=different, delay_s=delay)
+                                allow_different_target=different, delay_s=delay, uncovered=uncovered,
+                                on_acting=self._escape.start if self._escape is not None else None)
             job.start_in_background()
         except Exception as exc:
             self._set_run_result(ref, RunState.REFUSED, detail=f"{type(exc).__name__}: {exc}")
@@ -1819,13 +2056,115 @@ class AppController:
         self.playback = PlaybackView(True, self.run_dry, PlaybackState.RUNNING.value, self.run_macro_name,
                                      0, self._run_actions)
 
+    def _start_graph(self, ref: str, target: Target, script: Script) -> None:
+        """One target of a version-4 run: what the target declares it can do and every recorded macro its blocks
+        name (read in `start_run`), its window in front, preflight of those macros -- then its own `GraphJob`."""
+        problem = flows.graph_refusal(script, target, self._graph_macros)
+        if problem:
+            self._set_run_result(ref, RunState.REFUSED, total=self._run_actions, detail=problem)
+            return
+        different = any(m.target.target_id != target.target_id for m in self._graph_macros.values())
+        uncovered = self._fronted(ref, target)
+        if uncovered is None:
+            return
+        try:
+            for key, macro in self._graph_macros.items():
+                report = self.services.create_playback(macro, target, dry_run=self.run_dry,
+                                                       allow_different_target=different).preflight()
+                errors = _now_errors(report)
+                if errors:
+                    block = next((n.id for n in script.nodes if isinstance(n, MacroNode) and n.macro == key), None)
+                    detail = _refusal_detail(errors, block)
+                    self.preflight_lines = [f"{i.severity} {i.code}: {i.message}" for i in report.issues]
+                    self._set_run_result(ref, RunState.REFUSED, total=self._run_actions, detail=detail)
+                    return
+            delay = 0.0 if self.run_dry else max(0.0, self._run_delay - (self._clock() - self._run_started))
+            job = flows.GraphJob(script, target, self.services, macros=self._graph_macros, ocr=self.ocr,
+                                 dry_run=self.run_dry, allow_different_target=different, delay_s=delay,
+                                 uncovered=uncovered,
+                                 on_acting=self._escape.start if self._escape is not None else None)
+            job.start_in_background()
+        except Exception as exc:
+            self._set_run_result(ref, RunState.REFUSED, detail=f"{type(exc).__name__}: {exc}")
+            return
+        self._running[ref] = job
+        self._lit_job = job
+        self._set_run_result(ref, RunState.RUNNING, total=self._run_actions)
+        self.playback = PlaybackView(True, self.run_dry, PlaybackState.RUNNING.value, self.run_macro_name,
+                                     0, self._run_actions)
+
+    # ---- what the version-4 editor needs ----------------------------------------------------------------------
+    def target_screen_rect(self) -> tuple[int, int, int, int] | None:
+        """Where the chosen target's picture lies on this computer's screen (a picker lays its picture exactly over
+        it), or None (no target, or one that is not a place on this screen)."""
+        if not self.target_ready:
+            return None
+        try:
+            return self.services.screen_rect(self.target)
+        except Exception:
+            return None
+
+    def recorded_macro_choices(self) -> list[tuple[str, str]]:
+        """(key, label) of every recorded macro of the library, for a macro block to name: the name, with its folder
+        when it has one -- and a number when two would still read the same (a file copied in the file manager
+        keeps the name inside it), so a choice can never be taken for another macro."""
+        choices, seen = [], {}
+        for info in self.macros:
+            if not info.valid or info.version != 1:
+                continue
+            label = f"{info.name} ({info.folder})" if info.folder else info.name
+            seen[label] = seen.get(label, 0) + 1
+            if seen[label] > 1:
+                label = f"{label} [{seen[label]}]"
+            choices.append((info.key, label))
+        return choices
+
+    def macro_names(self) -> dict[str, str]:
+        return dict(self.recorded_macro_choices())
+
+    def run_from_editor(self, *, dry_run: bool = False) -> bool:
+        """Run the version-4 script open in the editor -- saved, so what runs is the file -- on the chosen target."""
+        if not self.editing_graph:
+            return self._fail("editor", "No script is open.", key="msg_no_editor")
+        if self.editing_new or self.editor_dirty:
+            return self._fail("editor", "Save the script before running it.", key="msg_graph_save_first")
+        if not self.target_ready or self.selected is None:
+            return self._fail("no_targets", "Choose the target first.", key="msg_graph_need_target")
+        key = self.editor_key
+        info = self.macro_by_key(key)
+        if info is None or file_stamp(info.path) != self.editor_stamp:
+            # the file was changed (or removed) outside since it was opened: what would run is not what is shown
+            name = self.editor.document.name
+            return self._fail("changed_outside", f"“{name}” was changed outside this application after it was "
+                                                 "opened here.", key="msg_editor_changed_outside", name=name)
+        if not self.select_macro(key) or not self.set_run_refs([self.selected.ref]):
+            return False
+        return self.start_run(dry_run=dry_run)
+
+    def save_recording_for_block(self, name: str) -> str:
+        """The recording just made, saved under `name` in the library: its key ("" when it was not saved)."""
+        if not self.save(name):
+            return ""
+        return self.library.key_of(self.macro_path) if self.macro_path is not None else ""
+
+    @property
+    def graph_lit(self) -> dict[str, str]:
+        """The blocks of the version-4 script that runs (or ran last), lit: block id -> "running" / "visited" /
+        "failed" -- what the editor shows while a run is on and after it."""
+        job = self._lit_job
+        return job.lit if job is not None else {}
+
+    def clear_lit(self) -> None:
+        self._lit_job = None
+        self._touch()
+
     def _poll_batch(self) -> None:
         """The ONE place a batch's threads are observed, and it runs on the UI thread: engines are only read
         here, never written to from a worker, and nothing else in the application touches their state."""
         if self.emergency_active and (self._run_queue or self._running):
             self._abort_run("emergency_stop")
         for ref, engine in list(self._running.items()):
-            if isinstance(engine, flows.FlowJob):
+            if isinstance(engine, (flows.FlowJob, flows.GraphJob)):
                 if engine.running:
                     self._notice_start(engine)
                     # a script waiting to start says how long it still waits, once a second
@@ -1874,7 +2213,12 @@ class AppController:
         else:
             state = RunState.FAILED
             failure = report.failure
-            detail = f"{failure.code}: {failure.message}" if failure else "failed"
+            if failure is None:
+                detail = "failed"
+            elif failure.params:                  # the names and numbers its sentence needs, for the history
+                detail = explain.encode(failure.code, None, dict(failure.params), failure.message)
+            else:
+                detail = f"{failure.code}: {failure.message}"
         self._log_let_go(ref, report.released_at_end)
         if report.held_at_end:
             detail = "; ".join(filter(None, (detail, "still held: " + ", ".join(report.held_at_end))))
@@ -1915,6 +2259,9 @@ class AppController:
                                      total=result.total,
                                      detail=result.detail or "the run ended before this target finished")
         self.run_active, self._run_queue, self._running, self._run_flow = False, [], {}, None
+        if self._escape is not None:
+            self._escape.stop()                 # Esc anywhere means nothing once the run is over
+            self._escape = None
         self.playback = PlaybackView(False, self.run_dry, "idle", self.run_macro_name, 0, self._run_actions)
         states = [r.state for r in self.run_results]
         done = states.count(RunState.COMPLETED)
@@ -1944,10 +2291,12 @@ class AppController:
         level = {run_history.COMPLETED: "ok", run_history.PARTIAL: "warn", run_history.STOPPED: "warn"}.get(
             outcome, "error")
         kind = "Dry run" if self.run_dry else "Run"
+        # why the first target that did not finish did not: the notice says it too -- a dry run is in no history
+        why = next((r.detail for r in self.run_results if r.state is not RunState.COMPLETED and r.detail), "")
         self._say(level, "playback", f"{kind} {outcome}: “{self.run_macro_name}” on {len(self.run_results)} "
                                      f"target(s), {done} finished.",
                   key=("msg_dry_result" if self.run_dry else f"msg_run_{outcome}"), name=self.run_macro_name,
-                  total=len(self.run_results), done=done)
+                  total=len(self.run_results), done=done, why=why)
 
     def save(self, name: str, *, folder: str = "", overwrite: bool = False) -> bool:
         if self.macro is None:
@@ -1966,10 +2315,14 @@ class AppController:
             return self._explain(exc, "storage")
         self.macro, self.macro_path, self.unsaved = named, path, False
         written = self.library.key_of(path)
+        self.remember_target_for(written, path)    # recorded on it: remembered with it (item 12)
         # the very same recording written again keeps its targets; anything else under this name -- a different
         # recording over it, or a new file where one was deleted outside -- never inherits them
         cleared = self._restamp(written, path) if same else self._forget_targets_of(written)
         self.refresh_macros()
+        info = self.macro_by_key(written)
+        if cleared and info is not None and self._targets_again(info):
+            cleared = False                       # the target it was recorded on, found again (item 12)
         if cleared:
             return self._say("ok", "saved", f"Saved “{name}”. It now does something else, so its run targets were "
                                             "cleared: choose them again.", key="msg_saved_targets_cleared", name=name)
@@ -2052,9 +2405,10 @@ class AppController:
 
     def cancel(self) -> bool:
         if self.run_active:
-            # NOT "stopped" yet: said before aborting, so that if engines are still running the status stays
-            # "Stopping…" until they confirm, and if the batch ends right away its own result replaces this.
-            self._say("warn", "cancelled", "Stopping… nothing more will be sent.", key="msg_stopping")
+            # Said before aborting: no new action is sent from now on (every engine checks its cancel before each
+            # action; one already being sent finishes, and what it holds is let go); the batch's own result -- how
+            # many targets finished, once every engine has ended -- replaces this.
+            self._say("warn", "cancelled", "Stopped: no new action is sent; one already under way finishes.", key="msg_stopping")
             self._abort_run("cancelled")
             return True
         if self.engine is not None:
@@ -2062,7 +2416,7 @@ class AppController:
                 self.engine.cancel("cancelled")
             except PlaybackStateError:
                 pass                                   # it just finished; poll() reports the real end state
-            return self._say("warn", "cancelled", "Cancelling… nothing more will be sent.", key="msg_stopping")
+            return self._say("warn", "cancelled", "Stopped: no new action is sent; one already under way finishes.", key="msg_stopping")
         if self.recorder is not None:
             try:
                 self.recorder.cancel()

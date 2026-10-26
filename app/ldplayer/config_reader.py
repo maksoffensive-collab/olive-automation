@@ -56,11 +56,16 @@ class InstanceConfig:
     memory_mb: int | None
     player_name: str | None = None
     keys: tuple[str, ...] = field(default=(), compare=False)
+    adb_debug: int | None = None      # LDPlayer's "ADB debugging" setting: 0 = off (no ADB connection at all)
 
 
 def _s(data: dict[str, Any], key: str) -> str | None:
     value = data.get(key)
     return str(value) if value not in (None, "") else None
+
+
+def _int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def parse_instance_config(index: int, path: Path, data: dict[str, Any]) -> InstanceConfig:
@@ -83,6 +88,7 @@ def parse_instance_config(index: int, path: Path, data: dict[str, Any]) -> Insta
         memory_mb=data.get("advancedSettings.memorySize"),
         player_name=_s(data, "statusSettings.playerName"),
         keys=tuple(data.keys()),
+        adb_debug=_int(data.get("basicSettings.adbDebug")),
     )
 
 

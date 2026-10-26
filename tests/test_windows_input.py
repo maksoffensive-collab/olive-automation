@@ -631,12 +631,18 @@ class NoGlobalOrForegroundFallback(unittest.TestCase):
         explicit decision of 2026-10-19 (docs/ARCHITECTURE.md, "Full Windows macros"): a separate, closed set of
         primitives that only the gated `DesktopInputSession` (app/windows/desktop.py) may call. Letting go at the end
         of a live run, on the person's decision of 2026-10-20: two releases that press nothing, which only
-        `WindowInputSession.release_held` (app/windows/input.py) may call."""
+        `WindowInputSession.release_held` (app/windows/input.py) may call. A run's window brought to the front, on the
+        person's decision of 2026-10-25: `raise_window`, which sends nothing and which only the Windows services
+        (app/bootstrap/windows_services.py, `bring_to_front`, the verified window re-checked first) may call -- and,
+        on the person's decisions of 2026-10-25/26 (a Full Windows recording played click by click in the window
+        each click was in), app/windows/places.py (`PlaceFinder.bring_to_front`: the window found again by its
+        recorded program, class and title just before, never this application's own)."""
         methods = {n for n in dir(WindowInputBackend) if not n.startswith("_")}
         window = {"client_size", "post_mouse", "post_key", "post_char"}
         desktop = {"window_at", "foreground_window", "desktop_mouse", "desktop_key", "desktop_char"}
         releasing = {"release_primary", "release_secondary", "release_key"}
-        self.assertEqual(methods, window | desktop | releasing)
+        fronting = {"raise_window"}
+        self.assertEqual(methods, window | desktop | releasing | fronting)
         for name in ("post_mouse", "post_key", "post_char"):
             self.assertEqual(list(inspect.signature(getattr(WindowInputBackend, name)).parameters)[:2], ["self", "hwnd"])
         for path in ROOT.rglob("*.py"):
@@ -647,6 +653,9 @@ class NoGlobalOrForegroundFallback(unittest.TestCase):
             for sender in ("release_primary(", "release_secondary(", "release_key("):
                 if "." + sender in text:
                     self.assertEqual(path.relative_to(ROOT).as_posix(), "windows/input.py", sender)
+            if ".raise_window(" in text:
+                self.assertIn(path.relative_to(ROOT).as_posix(), ("bootstrap/windows_services.py",
+                                                                  "windows/places.py"))
 
     def test_session_public_surface_is_exactly_the_documented_operations(self):
         public = {n for n in dir(WindowInputSession) if not n.startswith("_")}
@@ -1043,6 +1052,43 @@ class MouseIsAlwaysDeliveredAsARealClick(unittest.TestCase):
         with self.assertRaises(InputDeliveryError):
             self.backend.post_mouse(self.core, M.LEFT_DOWN, 30, 20)
         self.assertEqual(self.sent_inputs, [])
+
+    def test_a_release_under_a_window_the_press_opened_is_let_go_where_the_pointer_is(self):
+        """The person's decision of 2026-10-26: a click whose press opened a window over the point (its own menu or
+        dialog) is not a failed run. The release presses nothing: it is sent where the pointer already is -- no
+        move, as when a run lets go at its end -- instead of being refused as "covered"."""
+        MOVE, ABSOLUTE, LEFTUP, RIGHTUP = 0x0001, 0x8000, 0x0004, 0x0010
+        for down, up, flag in ((M.LEFT_DOWN, M.LEFT_UP, LEFTUP), (M.RIGHT_DOWN, M.RIGHT_UP, RIGHTUP)):
+            self.sent_inputs.clear()
+            self.window_from_point_result[0] = self.core
+            self.backend.post_mouse(self.core, down, 30, 20)
+            self.window_from_point_result[0] = self.classic                 # the press opened a window there
+            self.backend.post_mouse(self.core, up, 30, 20)                  # not refused
+            self.assertEqual(len(self.sent_inputs), 2)
+            (_, _, flags), = self.sent_inputs[1]
+            self.assertTrue(flags & flag)
+            self.assertFalse(flags & (MOVE | ABSOLUTE), "a release under a window is not moved anywhere")
+
+    def test_presses_and_moves_under_a_window_are_still_refused(self):
+        self.window_from_point_result[0] = self.classic
+        for event in (M.LEFT_DOWN, M.RIGHT_DOWN, M.MOVE, M.MOVE_LEFT_HELD):
+            with self.assertRaises(InputDeliveryError):
+                self.backend.post_mouse(self.core, event, 30, 20)
+        self.window_from_point_result[0] = self.core
+        self.backend.post_mouse(self.core, M.LEFT_DOWN, 30, 20)
+        self.backend.post_mouse(self.core, M.LEFT_UP, 30, 20)
+        self.window_from_point_result[0] = self.classic
+        with self.assertRaises(InputDeliveryError):                         # a double click's second press
+            self.backend.post_mouse(self.core, M.LEFT_DOUBLE, 30, 20)
+        self.assertEqual(len(self.sent_inputs), 2)
+
+    def test_a_release_whose_window_is_gone_is_still_refused(self):
+        """Only a covering window is let through: a window that cannot be found on the screen any more is not."""
+        self.backend.post_mouse(self.core, M.LEFT_DOWN, 30, 20)
+        self.backend._ClientToScreenBase = lambda hwnd, point: False
+        with self.assertRaises(InputDeliveryError):
+            self.backend.post_mouse(self.core, M.LEFT_UP, 30, 20)
+        self.assertEqual(len(self.sent_inputs), 1)
 
     def test_left_down_sends_exactly_one_move_and_one_down_event(self):
         self.backend.post_mouse(self.core, M.LEFT_DOWN, 30, 20)

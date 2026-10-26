@@ -28,6 +28,16 @@ grows down; they follow the target when it moves and are never converted to scre
 outside the content area can only appear for a drag that began inside it (the release / moves are then recorded
 where they really happened).
 
+Places (a recording on the whole screen only; the person's decision of 2026-10-25/26): a pointer event may name
+the place it happened IN -- a program's own surface, as the provider names it (`Place`: the program, the kind of
+surface, its title, the size of its content area then, whether it was already there when the recording started, and
+which recorded surface it is: one number per surface, the same for each of its places when its title or size
+changed) -- and the point inside that place's content area (`RecordedEvent.place` = (index into
+`Recording.places`, x, y)). Playback finds the place again and plays the event at the same point of it, wherever it
+is now. Texts are kept as `clean_place_text` makes them, so that what is read again compares equal. A press whose
+surface could not be identified when it was recorded is marked `(UNKNOWN_PLACE, 0, 0)`: it is played nowhere (a
+run of it is refused), never at its old screen point.
+
 Session lifecycle (`RecorderState`): IDLE -> RECORDING -> COMPLETED | CANCELLED | INVALID_TARGET, and
 `discard()` -> IDLE. Stopping is atomic, so there is no separate "stopping" state. Only COMPLETED exposes a
 `Recording`; cancelled and invalid-target sessions expose only the reason. A finished session refuses `start()`
@@ -39,7 +49,7 @@ from __future__ import annotations
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable, Protocol, runtime_checkable
 
@@ -48,6 +58,8 @@ from app.providers.base import TargetIdentity, check_size
 from app.providers.input import Key
 
 MAX_TEXT_LENGTH = 256
+MAX_PLACE_TEXT = 256
+UNKNOWN_PLACE = -1           # RecordedEvent.place index: pressed where the surface could not be identified
 MAX_EVENTS = 100_000
 _COORD_LIMIT = 1_000_000
 _REASON = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -87,6 +99,44 @@ def _valid_reason(reason: object) -> bool:
     return isinstance(reason, str) and bool(_REASON.match(reason))
 
 
+def _place_text(value: object, *, empty: bool = False) -> bool:
+    return (isinstance(value, str) and (empty or bool(value)) and len(value) <= MAX_PLACE_TEXT
+            and value.isprintable())
+
+
+def clean_place_text(text: str) -> str:
+    """A place's program, kind or title as it is kept: what is not printable becomes a space, at most
+    MAX_PLACE_TEXT characters. The recorder and the playback both use it, so a title compares as it was kept."""
+    return "".join(c if c.isprintable() else " " for c in str(text))[:MAX_PLACE_TEXT]
+
+
+@dataclass(frozen=True)
+class Place:
+    """What a pointer event on the whole screen happened IN, as the provider names it and a person would recognise
+    it: the program, the kind of surface, its title; the size of its content area then; whether it was already
+    there when the recording started (`at_start`); and which recorded surface it is (`window`: one number per
+    surface, shared by every place of it -- its title or size may change during a recording). One that was there
+    at the start is looked for before the first event is played; one that appeared during the recording (opened by
+    an earlier click) when its event comes."""
+    program: str
+    kind: str
+    title: str
+    width: int
+    height: int
+    at_start: bool
+    window: int
+
+    def __post_init__(self) -> None:
+        if not (_place_text(self.program) and _place_text(self.kind) and _place_text(self.title, empty=True)):
+            raise ValueError(f"A place needs its program and kind (1..{MAX_PLACE_TEXT} printable characters) and "
+                             "a title (it may be empty).")
+        check_size((self.width, self.height), "A place's size")
+        if not isinstance(self.at_start, bool):
+            raise ValueError("at_start must be True or False.")
+        if not _is_int(self.window) or not 0 <= self.window < MAX_EVENTS:
+            raise ValueError("window must be a whole number, not negative.")
+
+
 @dataclass(frozen=True)
 class RecordedEvent:
     kind: RecordedEventKind
@@ -97,6 +147,7 @@ class RecordedEvent:
     click_count: int | None = None
     key: Key | None = None
     text: str | None = None
+    place: tuple[int, int, int] | None = None      # (index into Recording.places, x, y inside it): see Places
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, RecordedEventKind):
@@ -128,6 +179,16 @@ class RecordedEvent:
         if texted and (not isinstance(self.text, str) or not 1 <= len(self.text) <= MAX_TEXT_LENGTH
                        or not all(c.isprintable() for c in self.text)):
             raise ValueError(f"text must be 1..{MAX_TEXT_LENGTH} printable characters.")
+        if self.place is not None:
+            if not pointer:
+                raise ValueError(f"{self.kind.value} does not take 'place'.")
+            if (not isinstance(self.place, tuple) or len(self.place) != 3 or not all(map(_is_int, self.place))
+                    or self.place[0] < UNKNOWN_PLACE or any(abs(v) > _COORD_LIMIT for v in self.place[1:])
+                    or (self.place[0] == UNKNOWN_PLACE and self.place != (UNKNOWN_PLACE, 0, 0))):
+                raise ValueError("place must be (index, x, y): whole numbers, the index not negative -- or "
+                                 f"({UNKNOWN_PLACE}, 0, 0), a surface that could not be identified.")
+            if self.place[0] == UNKNOWN_PLACE and self.kind is not RecordedEventKind.BUTTON_DOWN:
+                raise ValueError("Only a press is marked as made where the surface could not be identified.")
 
 
 @dataclass(frozen=True)
@@ -142,6 +203,7 @@ class Recording:
     end_reason: str = "stopped"
     skipped: tuple[tuple[str, int], ...] = ()
     size: tuple[int, int] | None = None
+    places: tuple[Place, ...] = ()
 
     def __post_init__(self) -> None:
         TargetIdentity(self.provider_id, self.target_id)      # validates non-empty strings
@@ -155,6 +217,17 @@ class Recording:
                 or not all(_valid_reason(k) and _is_int(n) and n > 0 for k, n in self.skipped):
             raise ValueError("skipped must be sorted unique (reason, positive count) pairs.")
         object.__setattr__(self, "size", check_size(self.size))
+        if not isinstance(self.places, tuple) or not all(isinstance(p, Place) for p in self.places):
+            raise ValueError("places must be a tuple of Place.")
+        used = {e.place[0] for e in self.events if e.place is not None and e.place[0] != UNKNOWN_PLACE}
+        if used != set(range(len(self.places))):
+            raise ValueError("Every event's place must be one of the recording's places, and every place must have "
+                             "an event in it.")
+        surfaces: dict[int, tuple] = {}
+        for p in self.places:
+            if surfaces.setdefault(p.window, (p.program, p.kind, p.at_start)) != (p.program, p.kind, p.at_start):
+                raise ValueError("The places of one recorded surface must name the same program and kind, and say "
+                                 "the same about the start.")
 
     @property
     def target(self) -> TargetIdentity:
@@ -169,6 +242,16 @@ class Recording:
 
 
 _CHANGED = object()          # the size changed while recording
+
+
+def kept_places(events, places) -> tuple[tuple[RecordedEvent, ...], tuple[Place, ...]]:
+    """Only the places an event is in, renumbered in the order they were noted (a place noted for an event that was
+    then not recorded -- or whose events an editor removed -- is left out)."""
+    used = sorted({e.place[0] for e in events if e.place is not None and e.place[0] != UNKNOWN_PLACE})
+    number = {old: new for new, old in enumerate(used)}
+    kept = tuple(e if e.place is None or e.place[0] == UNKNOWN_PLACE
+                 else replace(e, place=(number[e.place[0]],) + e.place[1:]) for e in events)
+    return kept, tuple(places[i] for i in used)
 
 
 class RecordingSession:
@@ -193,6 +276,7 @@ class RecordingSession:
         self._end_reason: str | None = None
         self._end_detail = ""
         self._size = None
+        self._places: list[Place] = []
 
     # ---- read side -----------------------------------------------------
     @property
@@ -239,7 +323,8 @@ class RecordingSession:
 
     def record(self, kind: RecordedEventKind, *, x: int | None = None, y: int | None = None,
                button: PointerButton | None = None, click_count: int | None = None, key: Key | None = None,
-               text: str | None = None, at_ns: int | None = None) -> RecordedEvent:
+               text: str | None = None, at_ns: int | None = None,
+               place: tuple[int, int, int] | None = None) -> RecordedEvent:
         """Append one event. `at_ns` is the monotonic time it happened (default: now); it may not go backwards."""
         with self._lock:
             if self._state is not RecorderState.RECORDING:
@@ -248,7 +333,9 @@ class RecordingSession:
             if not _is_int(now) or (self._last_ns is not None and now < self._last_ns):
                 raise RecorderStateError("Event time must be a monotonic integer (nanoseconds).")
             delay = 0 if self._last_ns is None else (now - self._last_ns + 500_000) // 1_000_000
-            event = RecordedEvent(kind, delay, x, y, button, click_count, key, text)   # validates
+            event = RecordedEvent(kind, delay, x, y, button, click_count, key, text, place)   # validates
+            if place is not None and place[0] >= len(self._places):
+                raise ValueError("The event's place was not noted with place_of().")
             if len(self._events) >= self._max:
                 self._end(RecorderState.CANCELLED, "event_limit", f"more than {self._max} events")
                 raise RecorderStateError("Event limit reached; the recording was cancelled.")
@@ -268,6 +355,17 @@ class RecordingSession:
             elif self._size != size:
                 self._size = _CHANGED
 
+    def place_of(self, place: Place) -> int:
+        """The index events give the place `place` (see Places): the same place noted again gets the same index."""
+        if not isinstance(place, Place):
+            raise ValueError("place must be a Place.")
+        with self._lock:
+            if self._state is not RecorderState.RECORDING:
+                raise RecorderStateError("Only a running recording can note a place.")
+            if place not in self._places:
+                self._places.append(place)
+            return self._places.index(place)
+
     def note_skipped(self, reason: str) -> None:
         with self._lock:
             if self._state is not RecorderState.RECORDING:
@@ -280,9 +378,10 @@ class RecordingSession:
         with self._lock:
             if self._state is not RecorderState.RECORDING:
                 raise RecorderStateError(f"Cannot stop: the recorder is {self._state.value}, not recording.")
-            recording = Recording(self._target.provider_id, self._target.target_id, tuple(self._events), reason,
+            events, places = kept_places(self._events, self._places)
+            recording = Recording(self._target.provider_id, self._target.target_id, events, reason,
                                   tuple(sorted(self._skipped.items())),      # validated before any state change
-                                  None if self._size is _CHANGED else self._size)
+                                  None if self._size is _CHANGED else self._size, places)
             self._end(RecorderState.COMPLETED, reason, "")
             self._recording = recording
             return recording

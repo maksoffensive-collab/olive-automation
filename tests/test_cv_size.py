@@ -1,8 +1,10 @@
 """Adapting to the size (the person's decisions of 2026-10-20): a recorded macro remembers the size it was recorded
 at, a script the size of the picture its areas were picked on; "Adapt to the size" (scripts by default, recorded
-macros only when chosen) scales clicks, points, areas and pictures to the size the target has NOW -- when its
-proportions are the same (within PROPORTION_TOLERANCE); with other proportions it refuses rather than guess. Files
-written before keep working, unchanged, as they were ("as is").
+macros only when chosen) scales clicks, points, areas and pictures to the size the target has NOW. Clicks where
+nothing was looked at (recorded points, a distance from the match) only when its proportions are the same (within
+PROPORTION_TOLERANCE): with other proportions they are refused rather than guessed. A condition's point, area and
+picture follow any proportions, each direction by its own factor (decided on the person's report of 2026-10-25: a
+look that misses clicks nothing). Files written before keep working, unchanged, as they were ("as is").
 
 Fakes only: synthetic pictures, the simulated desktop of tests.test_gui (nothing is sent anywhere).
 """
@@ -157,9 +159,12 @@ class Recording_(gui_tests.Base):
                     session.record(K.POINTER_MOVE, x=1, y=1)
                 self.assertEqual(session.stop().size, kept)
 
-    def test_a_script_of_other_proportions_is_refused_before_it_does_anything(self):
+    def test_a_script_whose_recorded_clicks_have_other_proportions_is_refused_before_it_does_anything(self):
+        """Decided on the person's report of 2026-10-25: a script's conditions follow any size; a recorded macro's clicks at
+        fixed points still refuse other proportions -- there a miss is a click on something else."""
         self.pick("Notes")
-        macro = Macro(Recording("windows", self.c.target.target_id, click(11, 12).recording.events), "Inner")
+        macro = Macro(Recording("windows", self.c.target.target_id, click(11, 12).recording.events, size=(300, 10)),
+                      "Inner")
         key = self.library.key_of(self.library.save(ConditionalMacro("Thin", (RunMacro(macro),), size=(300, 10))))
         self.c.refresh_macros()
         self.c.select_macro(key)
@@ -171,9 +176,36 @@ class Recording_(gui_tests.Base):
             self.c.poll()
             time.sleep(0.02)
         result = self.c.run_results[0]
-        self.assertEqual(result.state.value, "failed")
+        self.assertEqual(result.state.value, "refused")                  # before its first step
         self.assertIn("proportions", result.detail)
         self.assertEqual([e for e in self.world.events if e[0] in ("mouse", "key", "char")], [])   # nothing sent
+
+    def run_script(self, script):
+        import time
+        key = self.library.key_of(self.library.save(script))
+        self.c.refresh_macros()
+        self.c.select_macro(key)
+        self.c.set_run_refs([self.entry("Notes").ref])
+        self.assertTrue(self.c.start_run(), self.c.status)
+        deadline = time.time() + 10
+        while self.c.run_active and time.time() < deadline:
+            self.c.poll()
+            time.sleep(0.02)
+        return self.c.run_results[0]
+
+    def test_clicks_where_nothing_is_looked_at_refuse_other_proportions_before_anything(self):
+        """The review of 2026-10-25: beside a match, or at the points of a recorded macro that does not know its own
+        size, a click would land elsewhere at other proportions -- refused before the first step, nothing sent."""
+        self.pick("Notes")                                               # 60x40 now; the scripts: 300x10
+        sizeless = Macro(Recording("windows", self.c.target.target_id, click(11, 12).recording.events), "Inner")
+        beside = Decision(Condition.pixel((1, 1), (30, 60, 200)), (TapMatch(offset=(5, 0)),))
+        for name, steps in (("Sizeless", (RunMacro(sizeless),)), ("Beside", (beside,))):
+            with self.subTest(name):
+                result = self.run_script(ConditionalMacro(name, steps, size=(300, 10)))
+                self.assertEqual(result.state.value, "failed")
+                self.assertIn("size_proportions_changed", result.detail)
+                self.assertEqual(result.completed, 0)
+                self.assertEqual([e for e in self.world.events if e[0] in ("mouse", "key", "char")], [])
 
     def test_a_script_whose_picture_would_be_too_small_is_refused_before_it_does_anything(self):
         import time
@@ -194,15 +226,16 @@ class Recording_(gui_tests.Base):
         self.assertIn("too small", result.detail)
         self.assertEqual([e for e in self.world.events if e[0] in ("mouse", "key", "char")], [])   # nothing sent
 
-    def test_testing_a_condition_on_other_proportions_says_so(self):
+    def test_testing_a_condition_on_other_proportions_answers_it(self):
+        """2026-10-25 ("Select area" went wrong once the target's window changed size): a condition only looks, so
+        it follows the window in any proportions, each direction by its own factor."""
         self.pick("Notes")
         job = self.c.begin_probe(Condition.pixel((1, 1), RED), picked_on=(300, 10))
         try:
             outcome = job()
         except Exception as exc:                                          # what the window's job runner hands on
             outcome = exc
-        self.assertIsNone(self.c.finish_probe(outcome, job))
-        self.assertEqual(self.c.status.key, "msg_other_proportions")
+        self.assertIsNotNone(self.c.finish_probe(outcome, job), self.c.status)
 
     def test_the_macro_inside_a_script_that_adapts_clicks_where_the_place_now_is(self):
         import time
@@ -232,6 +265,10 @@ class Recording_(gui_tests.Base):
 
 
 # ---- scripts: their areas follow the size ---------------------------------------------------------------------
+def blocks_of(w, h):
+    return Bitmap(w, h, bytes(((x + y) % 2) * 200 + c for y in range(h) for x in range(w) for c in range(3)))
+
+
 class Scripts(unittest.TestCase):
     def test_points_areas_and_pictures_are_scaled_to_the_frame(self):
         template = Bitmap.solid(4, 2, RED)
@@ -258,10 +295,15 @@ class Scripts(unittest.TestCase):
         self.assertEqual((found.matches[0].bounds.x, found.matches[0].bounds.y), (40, 20))
         self.assertTrue(context.observe(PixelQuery((20, 10), small.pixel(20, 10))).satisfied)
 
-    def test_other_proportions_end_the_look_with_a_reason(self):
-        context = self.context(Bitmap.solid(120, 40, WHITE), (60, 40))
+    def test_a_look_follows_other_proportions_direction_by_direction(self):
+        """2026-10-25: a window made only wider -- a point, an area and a picture of a condition move with it."""
+        screen = Bitmap.solid(120, 40, WHITE).with_rect(60, 10, 1, 1, RED)
+        context = self.context(screen, (60, 40))
+        self.assertTrue(context.observe(PixelQuery((30, 10), RED)).satisfied)
         with self.assertRaises(SizeChanged):
-            context.observe(PixelQuery((1, 1), WHITE))
+            context.scale()                                              # a click's distance does not follow
+        query = scaled_query(TemplateQuery(blocks_of(4, 4), region=Roi(10, 5, 30, 20)), 2.0, 1.0, 120, 40)
+        self.assertEqual((query.region, query.template.width, query.template.height), (Roi(20, 5, 60, 20), 8, 4))
 
     def test_without_a_size_or_as_is_nothing_is_scaled(self):
         context = self.context(Bitmap.solid(120, 80, WHITE).with_rect(10, 10, 1, 1, RED), None)
@@ -324,7 +366,9 @@ class AnySize(unittest.TestCase):
         from app.vision import template as tm
         query = TemplateQuery(blocks(2, 2, 1), any_size=True)
         context = ObservationContext(_Pictures(Bitmap.solid(20, 20, WHITE)))
-        with unittest.mock.patch.object(tm, "_FAST", [None]):
+        from app.vision import bitmap
+        self.assertIsNotNone(tm)
+        with unittest.mock.patch.object(bitmap, "_FAST", [None]):
             with self.assertRaises(InvalidQuery):
                 context.check_can_answer(query)
 
@@ -357,8 +401,8 @@ class Editor(unittest.TestCase):
         step = WaitUntil(Condition.pixel((60, 40), RED), 1, 0.5)
         fitted, size = fe.fit_to_script(self.doc((100, 50)), step, {"point": (200, 100)})
         self.assertEqual((fitted.condition.query.point, size), ((30, 20), (100, 50)))
-        with self.assertRaises(EditError):
-            fe.fit_to_script(self.doc((100, 50)), step, {"point": (200, 200)})   # other proportions
+        fitted, size = fe.fit_to_script(self.doc((100, 50)), step, {"point": (200, 200)})   # other proportions
+        self.assertEqual((fitted.condition.query.point, size), ((30, 10), (100, 50)))      # each direction its own
 
     def test_only_the_parts_picked_on_another_size_are_scaled(self):
         template = blocks(4, 2, 1)                                             # 8x8
@@ -398,12 +442,28 @@ class ReviewFixes(unittest.TestCase):
         r.run(Decision(Condition.pixel((30, 20), SCENE_RED), then=TapMatch(offset=(3, 2))))
         self.assertEqual([c[:2] for c in r.input.calls], [("tap", (33, 22))])
 
-    def test_other_proportions_met_half_way_end_the_run_with_its_report(self):
-        from tests.test_decide import a_macro
-        r = self.rig((100, 40))                                         # the scene is 200x100
-        report = r.run(RunMacro(a_macro()), WaitUntil(Condition.pixel((1, 1), RED), 1, 0.5))
+    def test_a_click_beside_the_match_still_refuses_other_proportions(self):
+        """The review of 2026-10-25: a look follows other proportions, but a click at a distance from the match is
+        a click at a point nobody looked at -- stretched by each direction's own factor it lands elsewhere. Refused
+        as before, with nothing sent; a click ON the match (no distance) follows the match wherever it was found."""
+        from tests.test_observe import RED as SCENE_RED                 # the scene: 200x100, red at (30, 20)
+        r = self.rig((100, 40))                                         # picked at other proportions
+        report = r.run(Decision(Condition.pixel((15, 8), SCENE_RED), then=TapMatch(offset=(3, 2))))
         self.assertEqual((report.state.value, report.reason), ("failed", "size_proportions_changed"))
-        self.assertEqual(len(report.steps), 1)                          # what was done before is still told
+        self.assertEqual(r.input.calls, [])
+        r = self.rig((100, 40))
+        report = r.run(Decision(Condition.pixel((15, 8), SCENE_RED), then=TapMatch()))
+        self.assertEqual(report.state.value, "completed", report.message)
+        self.assertEqual([c[:2] for c in r.input.calls], [("tap", (30, 20))])
+
+    def test_other_proportions_met_half_way_are_followed_by_a_look(self):
+        """Before 2026-10-25 they ended the run ("size_proportions_changed"); a look now follows them."""
+        from tests.test_decide import a_macro
+        from tests.test_observe import RED as SCENE_RED                 # the scene: 200x100, red at (30, 20)
+        r = self.rig((100, 40))                                         # picked at other proportions
+        report = r.run(RunMacro(a_macro()), WaitUntil(Condition.pixel((15, 8), SCENE_RED), 1, 0.5))
+        self.assertEqual(report.state.value, "completed", report.message)
+        self.assertEqual(len(report.steps), 2)
         self.assertEqual(len(r.input.calls), 1)
 
     def test_drag_points_outside_the_window_are_not_moved_to_its_edge(self):
@@ -455,16 +515,22 @@ class ReviewFixes(unittest.TestCase):
         self.assertEqual(tiny.template.width, 3)                                 # as small as it was picked: kept
 
     def test_any_size_never_looks_for_a_picture_smaller_than_it_can_be_told_apart(self):
-        from app.observe import observer
-        sizes = []
+        from app.vision import template as tm
+        if tm.fast_matcher() is None:
+            self.skipTest("OpenCV is not installed")
+        from app.vision import fast
+        sizes, real = [], fast.resize
 
-        def looked(frame, template, **kw):
-            sizes.append((template.width, template.height))
-            return []
-        with unittest.mock.patch.object(observer, "fast_matcher", lambda: object()), \
-                unittest.mock.patch.object(observer, "match_template", looked):
-            ObservationContext(_Pictures(noise(80, 60, 9))).observe(TemplateQuery(blocks(3, 2, 1), any_size=True))
-        self.assertEqual(min(sizes), (4, 4))                                     # 6x6: 4x4 at the smallest
+        def made(rgb, width, height, w, h):
+            sizes.append((w, h))
+            return real(rgb, width, height, w, h)
+        with unittest.mock.patch.object(fast, "resize", made):
+            found = ObservationContext(_Pictures(noise(80, 60, 9))).observe(
+                TemplateQuery(blocks(3, 2, 1), any_size=True))
+        self.assertTrue(sizes)
+        self.assertGreaterEqual(min(w for w, _ in sizes), 4)                    # 6x6: never under 4x4
+        self.assertGreaterEqual(min(h for _, h in sizes), 4)
+        self.assertGreaterEqual(found.detail["scale"] * 6, 4)
 
     def test_a_picture_is_resized_once_per_size_and_the_stop_is_heard_between_sizes(self):
         from app.core.errors import EmergencyStopped
@@ -476,20 +542,20 @@ class ReviewFixes(unittest.TestCase):
             context.observe(query)
             context.observe(query)
         self.assertEqual(resized.call_count, 1)
-        stop, looks, armed = EmergencyStop(), [], []
+        from app.vision import template as tm
+        if tm.fast_matcher() is None:
+            self.skipTest("a search in any size is refused without OpenCV")
+        from app.vision import fast
+        self.assertIsNotNone(observer)
+        stop, looks, real = EmergencyStop(), [], fast.shape_map
 
-        def looked(frame, template, **kw):
-            looks.append(template.width)
-            if armed:
-                stop.trigger("test")
-            return []
+        def looked(area, pattern):
+            looks.append(pattern.shape)
+            stop.trigger("test")                         # pressed while the first size is being looked at
+            return real(area, pattern)
         context = ObservationContext(_Pictures(noise(80, 60, 9)), stop=stop)
         query = TemplateQuery(blocks(4, 2, 5), any_size=True)
-        with unittest.mock.patch.object(observer, "fast_matcher", lambda: object()), \
-                unittest.mock.patch.object(observer, "match_template", looked):
-            context.observe(query)                       # every size made once: the next look resizes nothing
-            looks.clear()
-            armed.append(True)
+        with unittest.mock.patch.object(fast, "shape_map", looked):
             with self.assertRaises(EmergencyStopped):
                 context.observe(query)
         self.assertEqual(len(looks), 1)                                          # not the other sizes
@@ -556,32 +622,28 @@ class FastSearchReview(unittest.TestCase):
 
     def test_a_large_bright_picture_is_found_exactly_at_full_confidence(self):
         import random
-        from app.vision import fast, template as tm
-        rnd = random.Random(1)                          # float32 rounding of 7252 at the exact place
+        from app.vision import template as tm
+        rnd = random.Random(1)                          # float32 rounding is largest for large, bright pictures
         side, n = 520, 500
         scene = Bitmap(side, side, bytes(rnd.randrange(245, 256) for _ in range(side * side * 3)))
         pattern = cut(scene, 9, 7, n, n)
-        self.assertEqual(fast.candidates(scene.rgb, side, side, Roi(0, 0, side, side), pattern.rgb, n, n, 0.0, 100),
-                         [(0, 7, 9)])
         found = tm.match_template(frame_of(scene), pattern, min_confidence=1.0)
         self.assertEqual([(m.x, m.y, m.confidence) for m in found], [(9, 7, 1.0)])
 
     def test_the_exact_measure_is_done_in_pieces_of_bounded_memory(self):
         from app.vision import fast
-        self.assertEqual(fast.chunk_for(9, 7), fast.CHUNK)
-        for side in (100, 500, 2048):
-            with self.subTest(side=side):
-                per_position = side * side * 3 * fast.BYTES_PER_VALUE
-                self.assertLessEqual(fast.chunk_for(side, side) * per_position, max(fast.MEMORY, per_position))
         scene = noise(60, 40, 4)
         pattern = cut(scene, 20, 10, 9, 7)
-        args = (scene.rgb, 60, 40, Roi(0, 0, 60, 40), pattern.rgb, 9, 7, 9 * 7 * 3 * 255 * 0.4, 10 ** 6)
-        whole = fast.candidates(*args)
-        with unittest.mock.patch.object(fast, "MEMORY", 1):                     # one position at a time
-            self.assertEqual(fast.candidates(*args), whole)
-        with unittest.mock.patch.object(fast, "chunk_for", wraps=fast.chunk_for) as sized:
-            fast.candidates(*args)
-        sized.assert_called_once_with(9, 7)
+        places = [(y, x) for y in range(0, 34, 3) for x in range(0, 52, 5)]
+        args = (scene.rgb, 60, 40, pattern.rgb, 9, 7, places)
+        whole = fast.sums(*args)
+        pieces = []
+        with unittest.mock.patch.object(fast, "MEMORY", 1):                     # one place at a time
+            self.assertEqual(fast.sums(*args, check=lambda: pieces.append(1)), whole)
+        self.assertEqual(len(pieces), len(places))
+        pieces.clear()
+        fast.sums(*args, check=lambda: pieces.append(1))
+        self.assertEqual(len(pieces), 1)                                         # 64 MB holds them all at once
 
 
 if __name__ == "__main__":

@@ -381,7 +381,8 @@ class ScriptCanvasByHand(gui_tests.Base):
         from app.gui.controller import Screen
         from app.vision.roi import Roi
         from tests.test_vision_fast import frame as frame_of
-        self.open(script(steps=(WaitUntil(Condition.template(th_bitmap(8, 8)), 5, 0.5),), size=(100, 50)))
+        picture = th_bitmap(8, 8).with_rect(2, 2, 4, 4, (255, 255, 255))   # a shape: a flat one is refused
+        self.open(script(steps=(WaitUntil(Condition.template(picture), 5, 0.5),), size=(100, 50)))
         wait = self.view.layout.box_of((0,))
         self.click(wait.cx, wait.cy)
         form = self.editor.form.condition

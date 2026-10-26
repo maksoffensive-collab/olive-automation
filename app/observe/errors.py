@@ -33,8 +33,24 @@ class ObservationError(PlatformError):
     """Base for every failure to ASK the question. Never raised to mean "nothing was found"."""
 
 
+# The refusals of a query a person can meet, each by its `code` (a screen says them in the person's language):
+QUERY_CODES = ("picture_larger_than_area", "picture_fits_no_size", "flat_picture", "needs_fast", "area_outside_image",
+               "point_outside_image", "picture_too_small")
+
+
 class InvalidQuery(ObservationError):
-    """The query could not be applied to this frame: bad region, bad template, bad colour."""
+    """The query could not be applied to this frame: bad region, bad template, bad colour. One of QUERY_CODES names
+    itself in `code` and carries its numbers in `params`."""
+
+    def __init__(self, message: str = "", *, code: str = "", **params) -> None:
+        super().__init__(message)
+        self.code = code
+        self.params = params
+
+    @classmethod
+    def of(cls, exc: Exception) -> "InvalidQuery":
+        """The same refusal, from the picture code's own error: its words, its code and its numbers kept."""
+        return cls(str(exc), code=getattr(exc, "code", ""), **getattr(exc, "params", {}))
 
 
 class ObservationUnavailable(ObservationError):

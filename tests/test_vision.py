@@ -30,8 +30,9 @@ def _chunk(kind, data):
     return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
 
 
-def encode_png(bm: Bitmap, ctype=2, ftype=0) -> bytes:
-    """Test-only PNG encoder supporting colour types 0/2/6 and all five filter types."""
+def encode_png(bm: Bitmap, ctype=2, ftype=0, alphas: bytes | None = None) -> bytes:
+    """Test-only PNG encoder supporting colour types 0/2/6 and all five filter types (`alphas`: one per pixel, for
+    type 6; opaque when not given)."""
     bpp = {0: 1, 2: 3, 6: 4}[ctype]
     rows = []
     for y in range(bm.height):
@@ -40,7 +41,8 @@ def encode_png(bm: Bitmap, ctype=2, ftype=0) -> bytes:
             rows.append(bytearray(px))
         elif ctype == 6:
             r = bytearray(bm.width * 4)
-            r[0::4], r[1::4], r[2::4], r[3::4] = px[0::3], px[1::3], px[2::3], bytes([255]) * bm.width
+            a = alphas[y * bm.width:(y + 1) * bm.width] if alphas is not None else bytes([255]) * bm.width
+            r[0::4], r[1::4], r[2::4], r[3::4] = px[0::3], px[1::3], px[2::3], a
             rows.append(r)
         else:
             rows.append(bytearray(px[0::3]))
@@ -149,6 +151,59 @@ class DecoderTests(unittest.TestCase):
         for ftype in range(5):
             self.assertEqual(decode_png(encode_png(grey, 0, ftype)), grey)
 
+    def test_the_fast_decoder_gives_exactly_the_standard_librarys_pixels(self):
+        """With OpenCV a screenshot is decoded in milliseconds instead of a second or two: the very same pixels, for
+        every filter and colour type, a transparent pixel's colour kept as it is (alpha is dropped, never blended)."""
+        import random
+        from unittest import mock
+        from app.vision import bitmap
+        fast = bitmap.fast_module()
+        if fast is None:
+            self.skipTest("OpenCV is not installed")
+        rnd = random.Random(3)
+        bm = Bitmap(31, 17, bytes(rnd.randrange(256) for _ in range(31 * 17 * 3)))
+        grey = Bitmap(31, 17, bytes(v for v in (rnd.randrange(256) for _ in range(31 * 17)) for _ in range(3)))
+        alphas = bytes(rnd.choice((0, 1, 128, 255)) for _ in range(31 * 17))
+        for picture, ctype, extra in ((bm, 2, None), (bm, 6, alphas), (grey, 0, None)):
+            for ftype in range(5):
+                with self.subTest(ctype=ctype, ftype=ftype):
+                    data = encode_png(picture, ctype, ftype, extra)
+                    with mock.patch.object(fast, "decode_png", wraps=fast.decode_png) as used:
+                        quick = decode_png(data)
+                    used.assert_called_once()
+                    with mock.patch.object(bitmap, "_FAST", [None]):
+                        self.assertEqual(decode_png(data), quick)
+                    self.assertEqual(quick, picture)
+
+    def test_a_png_that_asks_to_be_turned_is_decoded_as_it_is_stored(self):
+        """A PNG may carry EXIF orientation (an eXIf chunk); a screenshot's pixels are never turned."""
+        from unittest import mock
+        from app.vision import bitmap
+        bm = Bitmap(5, 3, bytes(range(45)))
+        png = encode_png(bm)
+        for orientation in (3, 6):                      # turned half round (the same size), a quarter (another)
+            with self.subTest(orientation=orientation):
+                exif = b"MM\x00\x2a\x00\x00\x00\x08\x00\x01\x01\x12\x00\x03\x00\x00\x00\x01" \
+                    + bytes([0, orientation, 0, 0]) + b"\x00\x00\x00\x00"
+                turned = png[:33] + _chunk(b"eXIf", exif) + png[33:]         # after IHDR, before IDAT
+                self.assertEqual(decode_png(turned), bm)
+                with mock.patch.object(bitmap, "_FAST", [None]):
+                    self.assertEqual(decode_png(turned), bm)
+
+    def test_an_animated_png_is_decoded_by_the_standard_library(self):
+        """Review 2026-10-21: an APNG (acTL) may be decoded by OpenCV from another frame than its IDAT; the standard
+        library reads the IDAT picture, so OpenCV is not asked."""
+        from unittest import mock
+        from app.vision import bitmap
+        bm = Bitmap(5, 3, bytes(range(45)))
+        png = encode_png(bm)
+        animated = png[:33] + _chunk(b"acTL", b"\x00\x00\x00\x01\x00\x00\x00\x00") + png[33:]
+        fast = bitmap.fast_module()
+        if fast is None:
+            self.skipTest("OpenCV is not installed")
+        with mock.patch.object(fast, "decode_png", side_effect=AssertionError("OpenCV was asked")):
+            self.assertEqual(decode_png(animated), bm)
+
     def test_rejects_bad_input(self):
         good = encode_png(scene())
         corrupt = bytearray(good)
@@ -254,6 +309,19 @@ class ColorTests(unittest.TestCase):
         self.assertEqual(find_color(self.f, BLUE, tolerance=3), find_color(self.f, BLUE, tolerance=3))
 
 
+def likeness(a: Bitmap, b: Bitmap) -> float:
+    """The confidence of `a` against `b` (same size), straight from its definition in floating point: the normalised
+    correlation of the two (each channel less its average; 0 when negative) times 1 - the largest difference of a
+    channel's average / 255."""
+    n = a.width * a.height
+    ma = [sum(a.rgb[c::3]) / n for c in range(3)]
+    mb = [sum(b.rgb[c::3]) / n for c in range(3)]
+    da = [a.rgb[i] - ma[i % 3] for i in range(3 * n)]
+    db = [b.rgb[i] - mb[i % 3] for i in range(3 * n)]
+    shape = sum(x * y for x, y in zip(da, db)) / (sum(x * x for x in da) * sum(y * y for y in db)) ** 0.5
+    return round(max(0.0, shape) * (1 - max(abs(x - y) for x, y in zip(ma, mb)) / 255), 9)
+
+
 class TemplateTests(unittest.TestCase):
     def setUp(self):
         base = Bitmap.solid(120, 80, (240, 240, 240))
@@ -285,11 +353,28 @@ class TemplateTests(unittest.TestCase):
         ms = match_template(f, self.tpl, min_confidence=0.9, max_results=2)
         self.assertEqual([(x.x, x.y) for x in ms], [(90, 60), (20, 10)])  # exact copy ranks first
         self.assertEqual(ms[0].confidence, 1.0)
-        self.assertAlmostEqual(ms[1].confidence, 1 - (55 * 20) / (108 * 765), places=9)
+        expected = likeness(altered.crop(20, 10, 12, 9), self.tpl)
+        self.assertAlmostEqual(ms[1].confidence, expected, places=9)
+        self.assertAlmostEqual(expected, 0.953341605, places=9)
         self.assertEqual([(x.x, x.y) for x in match_template(f, self.tpl, min_confidence=0.999, max_results=2)], [(90, 60)])
-        # boundary: the altered copy scores 1 - 1100/82620 = 0.98669; the threshold must be applied exactly
-        self.assertEqual(len(match_template(f, self.tpl, min_confidence=0.985, max_results=2)), 2)
-        self.assertEqual(len(match_template(f, self.tpl, min_confidence=0.988, max_results=2)), 1)
+        # boundary: the threshold must be applied exactly
+        self.assertEqual(len(match_template(f, self.tpl, min_confidence=expected, max_results=2)), 2)
+        self.assertEqual(len(match_template(f, self.tpl, min_confidence=expected + 1e-6, max_results=2)), 1)
+
+    def test_shape_and_colour_tell_alike_pictures_apart(self):
+        """A copy one step brighter is nearly the same picture; one of another colour, or grey, is not."""
+        brighter = Bitmap(12, 9, bytes(min(255, v + 10) for v in self.tpl.rgb))
+        grey = Bitmap(12, 9, bytes(v // 2 + 64 for v in self.tpl.rgb))
+        self.assertAlmostEqual(likeness(brighter, self.tpl), 1 - 10 / 255, places=2)
+        self.assertLess(likeness(grey, self.tpl), 0.8)
+        for picture in (brighter, grey):
+            scene = self.base.with_rect(0, 0, 1, 1, BLACK)
+            data = bytearray(scene.rgb)
+            for r in range(9):
+                i = ((40 + r) * 120 + 50) * 3
+                data[i:i + 36] = picture.rgb[r * 36:(r + 1) * 36]
+            (best, *_) = match_template(frame_of(Bitmap(120, 80, bytes(data))), picture, min_confidence=0.5)
+            self.assertEqual((best.x, best.y, best.confidence), (50, 40, 1.0))
 
     def test_no_match_returns_empty(self):
         other = Bitmap.solid(12, 9, (7, 7, 7)).with_rect(1, 1, 3, 3, (250, 250, 0))
@@ -413,6 +498,88 @@ class CoordinateTests(unittest.TestCase):
         self.assertEqual(rescale_pixel(PixelPoint(640, 360), (1280, 720), (960, 540)), PixelPoint(480, 270))
         self.assertEqual(rescale_pixel(PixelPoint(0, 0), (1280, 720), (1920, 1080)), PixelPoint(0, 0))
         self.assertEqual(rescale_pixel(PixelPoint(1279, 719), (1280, 720), (1920, 1080)), PixelPoint(1919, 1079))
+
+
+class RefusalsCarryACode(unittest.TestCase):
+    """The person's report of 2026-10-25: a picture that did not fit its search area was refused in English. Every
+    refusal a person can meet names itself (`code`) and carries its numbers (`params`), so the screen says it in
+    the person's language, with what to do about it."""
+
+    def picture(self, w, h):
+        return Bitmap(w, h, bytes((x * 7 + y * 13 + c * 50) % 256 for y in range(h) for x in range(w) for c in range(3)))
+
+    def test_a_picture_larger_than_its_area(self):
+        from app.vision.template import search_template
+        frame = frame_of(self.picture(64, 48))
+        with self.assertRaises(VisionError) as caught:
+            search_template(frame, self.picture(30, 20), roi=Roi(0, 0, 20, 15))
+        self.assertEqual(caught.exception.code, "picture_larger_than_area")
+        self.assertEqual(caught.exception.params, {"picture": "30×20", "area": "20×15"})
+
+    def test_a_flat_picture(self):
+        from app.vision.template import check_template, search_template
+        flat = Bitmap(10, 10, bytes([90, 90, 90]) * 100)
+        for call in (lambda: check_template(flat), lambda: search_template(frame_of(self.picture(64, 48)), flat)):
+            with self.assertRaises(VisionError) as caught:
+                call()
+            self.assertEqual(caught.exception.code, "flat_picture")
+
+    def test_an_area_outside_the_picture(self):
+        with self.assertRaises(VisionError) as caught:
+            Roi(10, 10, 100, 50).check_within(64, 48)
+        self.assertEqual(caught.exception.code, "area_outside_image")
+        self.assertEqual(caught.exception.params, {"area": "100×50", "x": 10, "y": 10, "image": "64×48"})
+
+    def test_a_picture_that_fits_at_no_size(self):
+        from app.vision.template import fast_matcher, search_template
+        if fast_matcher() is None:
+            self.skipTest("the fast search is not installed")
+        with self.assertRaises(VisionError) as caught:
+            search_template(frame_of(self.picture(64, 48)), self.picture(60, 40), roi=Roi(0, 0, 20, 15),
+                            any_size=True)
+        self.assertEqual(caught.exception.code, "picture_fits_no_size")
+        self.assertEqual(caught.exception.params, {"picture": "60×40", "area": "20×15", "low": 50, "high": 200})
+
+
+class RefusalsCarryACodeThroughTheLayersAbove(unittest.TestCase):
+    """The review of 2026-10-25: the codes of the observation layer and the editor, and a confidence never rounded
+    in a run's details either."""
+
+    def frame(self):
+        return frame_of(Bitmap(64, 48, bytes((x * 7 + y * 13 + c * 50) % 256 for y in range(48) for x in range(64)
+                                             for c in range(3))))
+
+    def test_a_point_outside_the_picture(self):
+        from app.observe import InvalidQuery, PixelQuery, observe
+        with self.assertRaises(InvalidQuery) as caught:
+            observe(self.frame(), PixelQuery((100, 7), (1, 2, 3)))
+        self.assertEqual((caught.exception.code, caught.exception.params),
+                         ("point_outside_image", {"x": 100, "y": 7, "image": "64×48"}))
+
+    def test_any_size_without_the_fast_search(self):
+        from unittest import mock
+        from app.observe import InvalidQuery, TemplateQuery, observer
+        picture = self.frame().bitmap.crop(0, 0, 8, 8)
+        with mock.patch.object(observer, "fast_matcher", return_value=None), self.assertRaises(InvalidQuery) as caught:
+            observer.check_any_size(TemplateQuery(picture, any_size=True))
+        self.assertEqual(caught.exception.code, "needs_fast")
+
+    def test_the_editor_says_a_coded_refusal_in_the_persons_words(self):
+        from app.gui import flow_edit as fe
+        from app.observe import InvalidQuery
+        error = fe._rejected(InvalidQuery("The picture is flat.", code="flat_picture"))
+        self.assertEqual((error.key, error.params), ("err_query_flat_picture", {}))
+        self.assertEqual(fe._rejected(ValueError("no")).key, "err_flow_rejected")
+
+    def test_a_runs_details_keep_the_confidence_unrounded(self):
+        from app.decide import Condition
+        from app.decide.condition import ConditionResult
+        from app.observe import Match, ObservationResult
+        frame = self.frame()
+        condition = Condition.template(frame.bitmap.crop(0, 0, 8, 8))
+        observation = ObservationResult("template", True, frame.source, 0.0, 0.0,
+                                        (Match(Roi(0, 0, 8, 8), 0.999961234),))
+        self.assertEqual(ConditionResult(condition, observation).diagnostics()["confidence"], 0.999961234)
 
 
 if __name__ == "__main__":

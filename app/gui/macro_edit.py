@@ -34,8 +34,8 @@ from enum import Enum
 
 from app.playback.macro import ActionOp, Macro, MacroAction, compile_actions
 from app.providers.input import Key
-from app.providers.recording import (MAX_TEXT_LENGTH, PointerButton, RecordedEvent, RecordedEventKind as K,
-                                     Recording)
+from app.providers.recording import (MAX_TEXT_LENGTH, UNKNOWN_PLACE, Place, PointerButton, RecordedEvent,
+                                     RecordedEventKind as K, Recording, kept_places)
 
 MAX_PAUSE_MS = 10 * 60 * 1000          # 10 minutes; a longer pause is almost certainly a mistake
 MAX_COORD = 100_000
@@ -97,6 +97,7 @@ class Document:
     skipped: tuple[tuple[str, int], ...] = ()
     size: tuple[int, int] | None = None        # what it was recorded at (app/providers/size.py)
     adapt: bool = False                        # "Adapt to the size"
+    places: tuple[Place, ...] = ()             # the windows its clicks were in (a Full Windows recording)
 
     @property
     def actions(self) -> tuple[MacroAction, ...]:
@@ -136,10 +137,10 @@ def _grouped(recording: Recording) -> tuple[Step, ...]:
 
 
 def recording_of(document: Document) -> Recording:
-    events = tuple(event for step in document.steps for event in step.events)
+    events, places = kept_places([event for step in document.steps for event in step.events], document.places)
     try:
         return Recording(document.provider_id, document.target_id, events, document.end_reason, document.skipped,
-                         document.size)
+                         document.size, places)
     except ValueError as exc:
         raise EditNotRepresentable(str(exc)) from None
 
@@ -151,7 +152,8 @@ def macro_of(document: Document) -> Macro:
 def document_of(macro: Macro, name: str | None = None) -> Document:
     recording = macro.recording
     return Document(recording.provider_id, recording.target_id, macro.name if name is None else name,
-                    _grouped(recording), recording.end_reason, recording.skipped, recording.size, macro.adapt)
+                    _grouped(recording), recording.end_reason, recording.skipped, recording.size, macro.adapt,
+                    recording.places)
 
 
 def blocks_of(document: Document) -> tuple[Block, ...]:
@@ -183,7 +185,7 @@ def _with_groups(document: Document, groups: list[tuple[RecordedEvent, ...]]) ->
     if [len(g) for g in groups] != [len(step.events) for step in regrouped]:
         raise EditNotRepresentable("These actions cannot be stored exactly as recorded events, so the change was "
                                    "not applied.", "err_not_representable")
-    return replace(document, steps=regrouped)
+    return replace(document, steps=regrouped, places=recording.places)
 
 
 def _require_index(document: Document, index: int) -> MacroAction:
@@ -219,8 +221,17 @@ def set_point(document: Document, index: int, x: int, y: int) -> Document:
         if not isinstance(value, int) or isinstance(value, bool) or abs(value) > MAX_COORD:
             raise EditError("Coordinates must be whole numbers.", "err_coords")
     groups = _groups(document)
-    groups[index] = tuple(replace(e, x=x, y=y) if e.x is not None else e for e in groups[index])
+    groups[index] = tuple(_moved(e, x, y) if e.x is not None else e for e in groups[index])
     return _with_groups(document, groups)
+
+
+def _moved(event: RecordedEvent, x: int, y: int) -> RecordedEvent:
+    """`event` at (x, y). One that keeps the window it was in (a Full Windows recording) moves inside that window by
+    the same amount: the click still goes to that window, at the point now picked."""
+    if event.place is None or event.place[0] == UNKNOWN_PLACE:
+        return replace(event, x=x, y=y)
+    number, px, py = event.place
+    return replace(event, x=x, y=y, place=(number, px + x - event.x, py + y - event.y))
 
 
 def set_key(document: Document, index: int, key: Key) -> Document:

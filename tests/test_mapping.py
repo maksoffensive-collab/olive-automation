@@ -4,6 +4,7 @@ These prove the LOGIC refuses unsafe cases. They do NOT prove that the evidence 
 hold on a real LDPlayer 14 instance: that is [NEEDS TESTING] with one manually started instance.
 """
 import unittest
+import unittest.mock
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -27,6 +28,7 @@ class Inst:
     pid: int = 1000
     vbox: int = 2000
     android_id: str | None = None
+    adb_debug: int | None = None      # LDPlayer's own "ADB debugging" setting; None = not in the file
 
 
 @dataclass
@@ -58,6 +60,7 @@ class FakeConsole:
 
 class FakeAdb:
     def __init__(self, w): self.w = w
+    may_start_server = False
     def list_devices(self):
         if not self.w.server_up:
             raise AdbServerNotRunning("down")
@@ -73,11 +76,13 @@ class FakeAdb:
         raise AssertionError(f"unexpected property {name}")
 
 
-def make_service(w: World, registry=None, stop=None, logger=None):
+def make_service(w: World, registry=None, stop=None, logger=None, adb=None):
     def read_config(index):
         inst = next(i for i in w.instances if i.index == index)
         data = {"propertySettings.phoneAndroidId": inst.android_id,
                 "propertySettings.phoneIMEI": f"imei{index}", "propertySettings.macAddress": f"mac{index}"}
+        if inst.adb_debug is not None:
+            data["basicSettings.adbDebug"] = inst.adb_debug
         return parse_instance_config(index, Path("x"), data)
 
     def owners():
@@ -89,7 +94,8 @@ def make_service(w: World, registry=None, stop=None, logger=None):
                 out.setdefault(p, set()).add(d.owner_pid)
         return out
     registry = registry or InstanceRegistry.from_discovery(w.ld_instances())
-    return MappingService(registry, FakeConsole(w), FakeAdb(w), stop or EmergencyStop(), read_config, owners, logger)
+    return MappingService(registry, FakeConsole(w), adb or FakeAdb(w), stop or EmergencyStop(), read_config, owners,
+                          logger)
 
 
 def two_instance_world() -> World:
@@ -250,6 +256,128 @@ class VerifyRefusals(unittest.TestCase):
         exc = self.assertRefused(w, "no_verified_serial")
         for secret in ("aaaa1111", "bbbb2222", "zzzz"):
             self.assertNotIn(secret, str(exc))
+
+
+class StartingAdb(FakeAdb):
+    """An ADB that may start its server (as the application's may, 2026-10-21), in the background: the start is
+    asked for and returns at once; `up()` is the server coming up a moment later."""
+    may_start_server = True
+
+    def __init__(self, w, *, failure=None):
+        super().__init__(w)
+        self.asked, self.failure = 0, failure
+
+    def start_server_soon(self):
+        self.asked += 1
+        return True
+
+    def take_start_failure(self):
+        failure, self.failure = self.failure, None
+        return failure
+
+    def up(self):
+        self.w.server_up = True
+
+
+class ServerAndDebugging(unittest.TestCase):
+    """2026-10-21: the person wants LDPlayer controlled over ADB -- and the server was simply not running, so no
+    instance could ever be chosen. The application has LDPlayer's own ADB server started in the background -- never
+    waited for here: verifying runs on the window's thread, which also carries the emergency stop -- and says to
+    choose again in a moment; an instance whose own "ADB debugging" setting is off is named as such, with what to turn
+    on, instead of "no device"."""
+
+    def test_a_server_that_is_down_is_started_in_the_background_and_the_choice_asked_again(self):
+        import time
+        w = two_instance_world()
+        w.server_up = False
+        adb = StartingAdb(w)
+        began = time.monotonic()
+        with self.assertRaises(TargetNotVerified) as cm:
+            make_service(w, adb=adb).verify("ld1")
+        self.assertLess(time.monotonic() - began, 0.5)                     # nothing waited for
+        self.assertEqual((cm.exception.reason_code, adb.asked), ("adb_starting", 1))
+        self.assertIn("again", str(cm.exception))
+        adb.up()
+        self.assertEqual(make_service(w, adb=adb).verify("ld1").adb_serial, "emulator-5554")
+        self.assertEqual(adb.asked, 1)
+
+    def test_a_start_that_failed_is_said_with_its_reason_and_the_next_choice_tries_again(self):
+        """Review 2026-10-21: a start that fails in the background (port 5037 taken, adb.exe missing) must not leave
+        the person reading "it is being started" for ever."""
+        w = two_instance_world()
+        w.server_up = False
+        adb = StartingAdb(w, failure="Could not start the ADB server: cannot bind to 127.0.0.1:5037")
+        with self.assertRaises(TargetNotVerified) as cm:
+            make_service(w, adb=adb).verify("ld1")
+        self.assertEqual(cm.exception.reason_code, "adb_server")
+        self.assertIn("cannot bind", str(cm.exception))
+        self.assertEqual(adb.asked, 0)
+        with self.assertRaises(TargetNotVerified) as cm:
+            make_service(w, adb=adb).verify("ld1")
+        self.assertEqual((cm.exception.reason_code, adb.asked), ("adb_starting", 1))
+
+    def test_a_stop_while_the_server_is_found_down_is_the_stop(self):
+        w, stop = two_instance_world(), EmergencyStop()
+
+        class Down(StartingAdb):
+            def list_devices(self):
+                stop.trigger("test")
+                raise AdbServerNotRunning("down")
+        adb = Down(w)
+        with self.assertRaises(EmergencyStopped):
+            make_service(w, stop=stop, adb=adb).verify("ld1")
+        self.assertEqual(adb.asked, 0)
+
+    def test_a_server_that_is_up_is_never_started_again(self):
+        adb = StartingAdb(two_instance_world())
+        make_service(adb.w, adb=adb).verify("ld1")
+        self.assertEqual(adb.asked, 0)
+
+    def test_a_client_that_may_not_start_it_still_refuses(self):
+        w = two_instance_world()
+        w.server_up = False
+        with self.assertRaises(TargetNotVerified) as cm:
+            make_service(w).verify("ld1")
+        self.assertEqual(cm.exception.reason_code, "adb_server")
+
+    def test_a_stop_that_ended_an_adb_command_is_the_stop_never_a_refusal(self):
+        """The runner kills adb on the stop and the client reports an error: that is the stop (the stop is never turned into another error)."""
+        w, stop = two_instance_world(), EmergencyStop()
+
+        class Killed(FakeAdb):
+            def list_devices(self):
+                stop.trigger("test")
+                raise AdbError("ADB did not answer: cancelled")
+        with self.assertRaises(EmergencyStopped):
+            make_service(w, stop=stop, adb=Killed(w)).verify("ld1")
+
+    def test_adb_debugging_turned_off_in_the_instance_is_named_with_what_to_turn_on(self):
+        for others in (False, True):              # no device at all, or only another instance's
+            with self.subTest(others=others):
+                w = two_instance_world()
+                w.instances[0].adb_debug = 0
+                w.devices = w.devices[1:] if others else []
+                with self.assertRaises(TargetNotVerified) as cm:
+                    make_service(w).verify("ld1")
+                self.assertEqual(cm.exception.reason_code, "adb_debug_off")
+                self.assertIn("ADB debugging", str(cm.exception))
+                self.assertIn("restart", str(cm.exception))
+
+    def test_with_adb_debugging_on_or_not_known_the_reasons_stay_as_they_were(self):
+        for setting in (1, 2, None):
+            with self.subTest(setting=setting):
+                w = two_instance_world()
+                w.instances[0].adb_debug = setting
+                w.devices.clear()
+                with self.assertRaises(TargetNotVerified) as cm:
+                    make_service(w).verify("ld1")
+                self.assertEqual(cm.exception.reason_code, "no_adb_device")
+
+    def test_the_setting_is_read_from_the_instance_file(self):
+        self.assertEqual(parse_instance_config(1, Path("x"), {"basicSettings.adbDebug": 0}).adb_debug, 0)
+        self.assertEqual(parse_instance_config(1, Path("x"), {"basicSettings.adbDebug": 1}).adb_debug, 1)
+        self.assertIsNone(parse_instance_config(1, Path("x"), {}).adb_debug)
+        self.assertIsNone(parse_instance_config(1, Path("x"), {"basicSettings.adbDebug": "x"}).adb_debug)
 
 
 class VerifiedTargetIntegrity(unittest.TestCase):

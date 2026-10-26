@@ -530,8 +530,12 @@ def load_macro_file(path: str | Path) -> Macro | ConditionalMacro:
         text = p.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         raise MacroFormatError(f"The macro could not be read: {exc}") from None
-    if _is_v1(_parse(text)):
+    top = _parse(text)
+    if _is_v1(top):
         return v1.macro_from_json(text)                      # the v1 code path, byte for byte as before
+    from .graph_format import is_version_4, script_from_json      # version 4: blocks joined by arrows
+    if is_version_4(top):
+        return script_from_json(text, asset_dir_for(p))
     return conditional_from_json(text, asset_dir_for(p))
 
 
@@ -558,6 +562,10 @@ def summarize_macro_text(text: str) -> MacroSummary:
         macro = v1.macro_from_json(text)
         return MacroSummary(1, macro.name, len(macro.actions), macro.target.provider_id, macro.target.target_id,
                             len(macro.recording))
+    from .graph_format import VERSION as VERSION_4, is_version_4, summarize_script
+    if is_version_4(top):
+        name, blocks, pictures = summarize_script(top)
+        return MacroSummary(VERSION_4, name, blocks, assets=pictures)
     names = _AssetNames()
     macro = _conditional(top, names)
     return MacroSummary(top["version"], macro.name, len(macro.steps), assets=tuple(names.names))
@@ -686,9 +694,18 @@ def conditional_to_json(macro: ConditionalMacro) -> tuple[str, dict[str, bytes]]
     return text, assets
 
 
-def referenced_assets(macro: ConditionalMacro) -> frozenset[str]:
-    """The template file names a saved copy of `macro` refers to (what its asset folder must hold)."""
-    return frozenset(conditional_to_json(macro)[1])
+def referenced_assets(macro) -> frozenset[str]:
+    """The template file names a saved copy of `macro` (a script of version 2, 3 or 4) refers to (what its asset
+    folder must hold)."""
+    return frozenset(script_text(macro)[1])
+
+
+def script_text(macro) -> tuple[str, dict[str, bytes]]:
+    """The file text and pictures of a script of any version: `conditional_to_json`, or version 4's own."""
+    from .graph_format import Script, script_to_json
+    if isinstance(macro, Script):
+        return script_to_json(macro)
+    return conditional_to_json(macro)
 
 
 class _MemoryAssets(_AssetReader):
@@ -723,6 +740,10 @@ def validate_macro(macro: ConditionalMacro) -> None:
     text lengths, language tags, the polling floor, asset names and sizes). Running the reader over what the writer
     produced -- templates included, from memory -- applies all of them in one place, with the reader's own words,
     so an editor never needs a second copy of those rules and can never save a file it could not open again."""
+    from .graph_format import Script, validate_script
+    if isinstance(macro, Script):
+        validate_script(macro)
+        return
     text, assets = conditional_to_json(macro)
     again = _conditional(_parse(text), _MemoryAssets(assets))
     if again != macro:
@@ -757,6 +778,9 @@ def save_macro_file(macro: Macro | ConditionalMacro, path: str | Path, *, overwr
     if isinstance(macro, Macro):
         _write_new(p, v1.macro_to_json(macro).encode("utf-8"), overwrite)
         return p
+    from .graph_format import Script, save_script_file
+    if isinstance(macro, Script):
+        return save_script_file(macro, p, overwrite=overwrite)
     text, assets = conditional_to_json(macro)
     if p.exists() and not overwrite:
         raise MacroFormatError(f"{p.name} already exists.")

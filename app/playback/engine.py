@@ -85,6 +85,7 @@ class Failure:
     action_index: int
     delivered: int | None = None      # provider-reported partial delivery of a multi-message operation
     total: int | None = None
+    params: tuple[tuple[str, object], ...] = ()   # the names and numbers a translated sentence needs
 
 
 @dataclass(frozen=True)
@@ -335,12 +336,24 @@ class PlaybackEngine:
         except Exception as exc:                 # the engine itself must never die silently
             self._finish(PlaybackState.FAILED, None, Failure("engine_error", type(exc).__name__, self._index))
 
+    def _aim(self, index: int, action: MacroAction) -> MacroAction | None:
+        """The action as it is to be performed now, just before it is handed to the input session -- a dry run's
+        session too, which checks it and sends nothing: here unchanged. A provider may aim it anew (where the thing
+        it acts on is now) or raise to refuse it; None ends the run as cancelled (it was stopped or cancelled while
+        aiming). A provider's aiming must do nothing that changes the screen in a dry run (`self._dry`)."""
+        return action
+
     def _execute(self, index: int, action: MacroAction) -> bool:
         target_input = self._live_input()
         try:
             if target_input is not None:
                 if getattr(target_input, "target_id", None) != self._target.target_id:
                     raise SafetyViolation("The input session is no longer bound to the target.")
+                aimed = self._aim(index, action)
+                if aimed is None:                # the run was ended while the action was being aimed
+                    self._finish(PlaybackState.CANCELLED, self._abort_reason() or "cancelled")
+                    return False
+                action = aimed
                 method = getattr(target_input, METHOD[action.op])
                 if action.op in (ActionOp.KEY_PRESS, ActionOp.KEY_DOWN, ActionOp.KEY_UP):
                     method(action.key)
@@ -361,7 +374,8 @@ class PlaybackEngine:
                 return False
             code = getattr(exc, "reason_code", None) or type(exc).__name__
             self._finish(PlaybackState.FAILED, None, Failure(str(code), str(exc), index,
-                                                             getattr(exc, "delivered", None), getattr(exc, "total", None)))
+                                                             getattr(exc, "delivered", None), getattr(exc, "total", None),
+                                                             tuple(getattr(exc, "params", ()) or ())))
             return False
         with self._cond:
             self._completed += 1

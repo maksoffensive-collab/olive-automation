@@ -92,6 +92,44 @@ def macro_for(target, *events):
 
 
 class Discovery(unittest.TestCase):
+    def test_the_applications_client_may_start_the_adb_server_and_the_tools_do_not(self):
+        import tempfile
+        from unittest import mock
+        import app.bootstrap.ldplayer_services as module
+        from app.adb.client import AdbClient
+        from app.config.settings import load_settings
+        with tempfile.TemporaryDirectory() as folder:
+            for name in ("ldconsole.exe", "adb.exe"):
+                (Path(folder) / name).write_bytes(b"")
+            settings = load_settings(env={"LDPLAYER_DIR": folder})
+            with mock.patch("app.config.settings.load_settings", return_value=settings):
+                services = module.LDPlayerServices.create_default(EmergencyStop())
+        self.assertTrue(services._adb.may_start_server)
+        self.assertFalse(AdbClient(None, None, EmergencyStop()).may_start_server)      # the default: never
+
+    def test_the_adb_server_is_started_in_the_background_when_an_instance_is_running(self):
+        """So that by the time a person chooses an instance, the server is up (2026-10-21); never when nothing runs,
+        never by a client that may not start it, never waited for."""
+        from app.bootstrap.ldplayer_services import LDPlayerServices
+
+        class Starting(RecordingAdb):
+            may_start_server = True
+            asked = 0
+
+            def start_server_soon(self):
+                self.asked += 1
+                return True
+        for running, may, expected in ((True, True, 1), (False, True, 0), (True, False, 0)):
+            with self.subTest(running=running, may=may):
+                world = two_instance_world()
+                for inst in world.instances:
+                    inst.running = running
+                adb = Starting(world)
+                adb.may_start_server = may
+                LDPlayerServices(FakeConsole(world), adb, read_config_for(world), port_owners_for(world),
+                                 EmergencyStop()).discover()
+                self.assertEqual(adb.asked, expected)
+
     def test_registered_instances_appear_with_a_running_label(self):
         svc, *_ = rig()
         entries = svc.discover()
