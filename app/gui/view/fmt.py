@@ -120,8 +120,9 @@ def target_detail(ui, entry, *, with_group: bool = False) -> str:
     parts = [entry.provider_id]
     if with_group and entry.group:
         parts.append(group_label(ui, entry.group))
-    if entry.size:
-        parts.append(entry.size)
+    size = dict(entry.size_in).get(ui.t.language, entry.size)     # the provider's note in the person's language
+    if size:
+        parts.append(size)
     return "  ·  ".join(part for part in parts if part)
 
 
@@ -332,12 +333,13 @@ def explain_lines(ui, detail: str) -> list[str]:
     d = explain.parse(detail)
     if not d.reason and not d.message:
         return []
-    values = {"message": d.message, "issues": d.params.get("issues", d.message), **d.params}
+    message = d.params.get(f"message_{ui.t.language}") or d.message      # a provider's words in this language
+    values = {"message": message, "issues": d.params.get("issues", message), **d.params}
     if d.reason.startswith("query_"):
         why, fix = _say(ui, f"err_query_{d.reason[6:]}", values), ""
     else:
         why, fix = _say(ui, f"why_{d.reason}", values), _say(ui, f"fix_{d.reason}", values)
-    why = why or d.message or d.reason
+    why = why or message or d.reason
     lines = [ui.t("why_label").format(text=why)]
     if d.node:
         block = ui.t(_BLOCK_KEYS[d.node_kind]) if d.node_kind in _BLOCK_KEYS else d.node

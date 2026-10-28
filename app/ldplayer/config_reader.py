@@ -16,6 +16,8 @@ from typing import Any
 
 from app.core.errors import PlatformError
 
+ADB_DEBUG_KEY = "basicSettings.adbDebug"
+
 
 class InstanceConfigError(PlatformError):
     pass
@@ -58,6 +60,13 @@ class InstanceConfig:
     keys: tuple[str, ...] = field(default=(), compare=False)
     adb_debug: int | None = None      # LDPlayer's "ADB debugging" setting: 0 = off (no ADB connection at all)
 
+    @property
+    def adb_debug_off(self) -> bool:
+        """Whether LDPlayer's "ADB debugging" is off: set to "Close" (0), or not in the file at all -- LDPlayer's
+        default: a new instance's file has no such key, and the instance then opens no ADB port [VERIFIED 2026-10-27
+        on a new instance; 2026-09-25 on LDPlayer-10]. A value that is not a whole number is not known: False."""
+        return self.adb_debug == 0 or ADB_DEBUG_KEY not in self.keys
+
 
 def _s(data: dict[str, Any], key: str) -> str | None:
     value = data.get(key)
@@ -88,7 +97,7 @@ def parse_instance_config(index: int, path: Path, data: dict[str, Any]) -> Insta
         memory_mb=data.get("advancedSettings.memorySize"),
         player_name=_s(data, "statusSettings.playerName"),
         keys=tuple(data.keys()),
-        adb_debug=_int(data.get("basicSettings.adbDebug")),
+        adb_debug=_int(data.get(ADB_DEBUG_KEY)),
     )
 
 
@@ -98,11 +107,14 @@ def read_instance_config(ldplayer_dir: Path, index: int) -> InstanceConfig:
         with open(path, "rb") as handle:
             data = json.loads(handle.read().decode("utf-8-sig"))
     except FileNotFoundError:
-        raise InstanceConfigError(f"No configuration file for LDPlayer instance {index} at '{path}'.") from None
+        raise InstanceConfigError(f"No configuration file for LDPlayer instance {index} at '{path}'.").saying(
+            ru=f"Нет файла настроек экземпляра LDPlayer {index}: «{path}».") from None
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise InstanceConfigError(f"The configuration file for instance {index} is not valid JSON: {exc}") from None
+        raise InstanceConfigError(f"The configuration file for instance {index} is not valid JSON: {exc}").saying(
+            ru=f"Файл настроек экземпляра {index} — неправильный JSON: {exc}") from None
     if not isinstance(data, dict):
-        raise InstanceConfigError(f"The configuration file for instance {index} has an unexpected structure.")
+        raise InstanceConfigError(f"The configuration file for instance {index} has an unexpected structure.").saying(
+            ru=f"Файл настроек экземпляра {index} устроен не так, как ожидалось.")
     return parse_instance_config(index, path, data)
 
 

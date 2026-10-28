@@ -95,19 +95,22 @@ class AdbSession:
             if (fresh.logical_id, fresh.adb_serial) != (self._target.logical_id, self._target.adb_serial):
                 raise TargetNotVerified(
                     f"{self._target.ld_name} is now on a different ADB serial than before; the session is void.",
-                    reason_code="serial_changed")
+                    reason_code="serial_changed").saying(
+                    ru=f"{self._target.ld_name} теперь на другом серийном номере ADB, чем раньше; сеанс недействителен.")
             self._target = fresh
         state = self._device_state()
         if state is not DeviceState.DEVICE:
             raise TargetNotVerified(f"{self._target.ld_name} is not online over ADB (state: {state.value}).",
-                                    reason_code="device_not_online")
+                                    reason_code="device_not_online").saying(
+                ru=f"{self._target.ld_name} не на связи по ADB (состояние: {state.value}).")
         return self._target.adb_serial
 
     def _device_state(self) -> DeviceState:
         for dev in self._adb.list_devices():
             if dev.serial == self._target.adb_serial:
                 return dev.state
-        raise TargetNotVerified(f"{self._target.ld_name} is no longer listed by ADB.", reason_code="device_gone")
+        raise TargetNotVerified(f"{self._target.ld_name} is no longer listed by ADB.", reason_code="device_gone").saying(
+            ru=f"{self._target.ld_name} больше нет в списке устройств ADB.")
 
     # ---- read-only queries ----------------------------------------------
     def state(self) -> DeviceState:
@@ -122,7 +125,8 @@ class AdbSession:
         size = _SIZE_RE.search(self._adb.shell_query(serial, "wm", "size"))
         density = _DENSITY_RE.search(self._adb.shell_query(serial, "wm", "density"))
         if not size or not density:
-            raise AdbError("Could not parse the display size or density reported by the device.")
+            raise AdbError("Could not parse the display size or density reported by the device.").saying(
+                ru="Не удалось разобрать размер экрана или плотность, которые сообщило устройство.")
         return DisplayInfo(int(size.group(1)), int(size.group(2)), int(density.group(1)))
 
     def is_package_installed(self, package: str) -> bool:
@@ -143,7 +147,8 @@ class AdbSession:
         png = self._adb.screencap_png(serial, grant=_client.CaptureGrant(serial, _client._INPUT_MINT))
         width, height = png_size(png)
         if (width, height) != (display.width, display.height):
-            raise AdbError(f"Screenshot is {width}x{height} but the device reports {display.width}x{display.height}; discarded.")
+            raise AdbError(f"Screenshot is {width}x{height} but the device reports {display.width}x{display.height}; discarded.").saying(
+                ru=f"Снимок экрана {width}x{height}, а устройство сообщает {display.width}x{display.height}; снимок отброшен.")
         return AdbCapture(png, width, height, serial, self._target.logical_id)
 
     def save_screenshot(self, base_dir: Path) -> Path:

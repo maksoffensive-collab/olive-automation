@@ -8,7 +8,7 @@ from app.adb.client import (
     AdbClient, AdbError, AdbNotFound, AdbServerNotRunning, AdbStatus, DeviceState, parse_devices, parse_version,
 )
 from app.core.cancel import EmergencyStop
-from app.core.errors import EmergencyStopped, SafetyViolation
+from app.core.errors import EmergencyStopped, SafetyViolation, said_in
 from app.ldplayer.config_reader import (
     InstanceConfigError, find_identity_conflicts, parse_instance_config, read_instance_config,
 )
@@ -74,6 +74,22 @@ class LDConsoleTests(unittest.TestCase):
             with self.subTest(cmd=cmd), self.assertRaises(SafetyViolation):
                 console.run_readonly(cmd, "--index", "0")
         self.assertEqual(runner.calls, [])  # nothing was executed
+
+    def test_an_instance_is_closed_or_started_by_its_index_and_nothing_else(self):
+        """The person's decision of 2026-10-27 (Olive may turn ADB debugging on): `quit` and `launch` of ONE instance
+        by its index; every other command, a name, all instances, a number that is no index -- refused, unrun."""
+        runner = FakeRunner(lambda a: result(""))
+        console = LDConsole(self.path, runner, 5)
+        console.quit_instance(18)
+        console.launch_instance(0)
+        self.assertEqual([call[1:] for call, _ in runner.calls], [("quit", "--index", "18"), ("launch", "--index", "0")])
+        runner.calls.clear()
+        for command, index in (("quitall", 1), ("remove", 1), ("copy", 1), ("modify", 1), ("reboot", 1),
+                               ("adb", 1), ("list2", 1), ("quit", "LDPlayer-1"), ("quit", True), ("quit", -1),
+                               ("launch", 10000), ("launch", 1.0)):
+            with self.subTest(command=command, index=index), self.assertRaises(SafetyViolation):
+                console.run_on_instance(command, index)
+        self.assertEqual(runner.calls, [])
 
     def test_failure_modes_have_clear_errors(self):
         console = LDConsole(self.path, FakeRunner(lambda a: result("", "boom", 1)), 5)
@@ -275,8 +291,20 @@ class AdbClientTests(unittest.TestCase):
         self.assertEqual(len(runner.calls), 1)
         self.assertTrue(mem.query(operation="ADB_START_SERVER"))
         reason = c.take_start_failure()
-        self.assertIn("boom", reason)
+        self.assertIn("boom", str(reason))
+        self.assertIn("Не удалось запустить сервер ADB", said_in(reason, "ru"))
         self.assertIsNone(c.take_start_failure())                          # said once: the next choice tries again
+
+    def test_a_background_start_the_stop_cancelled_is_no_failure(self):
+        """The second review of 2026-10-27: after a reset, the next choice must not say "could not start"."""
+        def cancelled(_args):
+            self.stop.trigger("test")
+            return result(cancelled=True)
+        c, _ = self.client(cancelled, allow_server_start=True)
+        c.running = False
+        c.start_server_soon()
+        c._starting.join(5)
+        self.assertIsNone(c.take_start_failure())
 
     def test_every_command_gets_a_timeout(self):
         c, runner = self.client(lambda a: result("List of devices attached\n\n"))
@@ -353,6 +381,30 @@ class AdbClientTests(unittest.TestCase):
     def test_retries_argument_bounded(self):
         with self.assertRaises(ValueError):
             AdbClient(self.adb, FakeRunner(lambda a: result("")), self.stop, retries=99)
+
+    def test_a_listing_for_a_hint_is_asked_once_and_briefly(self):
+        """The list of targets waits for it (the review of 2026-10-27): one try, never retried, 3 s at most -- where
+        `list_devices` retries a hang with the client's whole timeout each time."""
+        c, runner = self.client(lambda a: result(timed_out=True), retries=2)
+        with self.assertRaises(AdbError):
+            c.list_devices_once()
+        self.assertEqual([timeout for _, timeout in runner.calls], [3.0])
+        runner.calls.clear()
+        with self.assertRaises(AdbError):
+            c.list_devices()
+        self.assertEqual([timeout for _, timeout in runner.calls], [7, 7, 7])
+        c, runner = self.client(lambda a: result(DEVICES))
+        self.assertEqual(len(c.list_devices_once()), 4)
+
+    def test_the_messages_a_person_reads_are_also_in_russian(self):
+        c, _ = self.client(lambda a: result(timed_out=True))
+        with self.assertRaises(AdbError) as cm:
+            c.list_devices_once()
+        self.assertIn("не ответил", cm.exception.said["ru"])
+        c.running = False
+        with self.assertRaises(AdbServerNotRunning) as cm:
+            c.list_devices()
+        self.assertIn("Сервер ADB не запущен", cm.exception.said["ru"])
 
     def test_logging_marks_attempts_and_hides_ids(self):
         mem = MemorySink()

@@ -108,6 +108,48 @@ class CommandRunnerTests(unittest.TestCase):
         self.assertIsNotNone(r.error)
 
 
+class ProcessRunningTests(unittest.TestCase):
+    """app.core.procs: whether a process still runs -- read-only, starts nothing; unknown means "still runs"."""
+
+    def test_a_running_process_an_ended_one_and_no_process(self):
+        import os
+        import subprocess
+        from app.core.procs import process_running
+        self.assertTrue(process_running(os.getpid()))
+        child = subprocess.Popen([sys.executable, "-c", "pass"])          # a process of this test's own
+        child.wait(timeout=30)
+        self.assertFalse(process_running(child.pid))                     # ended (its exit code is known)
+        for nothing in (0, -1, True, "12", 4_000_000):
+            self.assertFalse(process_running(nothing), nothing)
+
+    def test_a_process_it_may_not_ask_about_counts_as_running(self):
+        from unittest import mock
+
+        import app.core.procs as procs
+        for error, running in ((5, True), (87, False)):               # no right to ask / no such process
+            with self.subTest(error=error), \
+                    mock.patch.object(procs, "_kernel32", return_value=mock.Mock(OpenProcess=lambda *a: None)), \
+                    mock.patch.object(procs.ctypes, "get_last_error", return_value=error):
+                self.assertEqual(procs.process_running(1234), running)
+
+    def test_held_processes_are_asked_by_their_handles(self):
+        """Held before they are asked to end, so an id given to another program afterwards cannot look like them."""
+        import subprocess
+        from app.core.procs import hold_processes
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            with hold_processes((child.pid, 0, -1, 4_000_000)) as held:
+                self.assertTrue(held.running())
+                child.kill()
+                child.wait(timeout=30)
+                self.assertFalse(held.running())
+        finally:
+            if child.poll() is None:
+                child.kill()
+        with hold_processes((4_000_000,)) as gone:                      # gone already: nothing to wait for
+            self.assertFalse(gone.running())
+
+
 class SettingsTests(unittest.TestCase):
     def _fake_ld(self, root: Path) -> Path:
         d = root / "LDPlayer14"

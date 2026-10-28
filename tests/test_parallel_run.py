@@ -199,6 +199,53 @@ class SerialRouting(Base):
 
 
 # ---------------------------------------------------------------------------------------------------
+class OneInstanceTwoWays(Base):
+    """Two rows of the list that are ONE instance (reached two ways over ADB, 2026-10-27), both ticked: the macro
+    runs on it once, never twice at once; the second row is refused and says why."""
+
+    def test_two_rows_of_one_instance_run_it_once(self):
+        self.world.devices.append(Dev("127.0.0.1:5555", "id0001", 2001))   # LDPlayer-1 again, by `adb connect`
+        self.c.refresh()
+        rows = [e.ref for e in self.c.entries if e.ref.startswith("ld1@")]
+        self.assertEqual(len(rows), 2, [e.ref for e in self.c.entries])
+        self.c.set_concurrency(4)
+        self.c.set_run_refs(rows)
+        self.assertTrue(self.c.start_run(), self.c.status)
+        self.run_to_end()
+        self.assertEqual(sorted(r.state.value for r in self.c.run_results), ["completed", "refused"])
+        refused = next(r for r in self.c.run_results if r.state is RunState.REFUSED)
+        self.assertTrue(refused.detail.startswith("same_target"), refused.detail)
+        self.assertEqual(len(self.adb.log), TAPS)                              # the macro once, not twice
+
+
+class SaidInRussianAfterARun(Base):
+    """Why a run stopped, in the results and the history, in the person's language: the provider's own words travel
+    with the detail line (`message_ru`), so the screens never hold them (2026-10-27)."""
+    instances = 1
+
+    def test_a_device_gone_during_a_run_is_said_in_the_persons_language(self):
+        from types import SimpleNamespace
+
+        from app.gui.i18n import Translator
+        from app.gui.view import fmt
+        world, tap = self.world, self.adb.input_tap
+
+        def tap_then_gone(serial, x, y, *, grant):
+            tap(serial, x, y, grant=grant)
+            world.devices.clear()                   # the instance's device leaves ADB after the first tap
+        self.adb.input_tap = tap_then_gone
+        self.choose_all()
+        self.assertTrue(self.c.start_run(), self.c.status)
+        self.run_to_end()
+        result = self.c.run_results[0]
+        self.assertEqual(result.state, RunState.FAILED, result)
+        ru = " ".join(fmt.explain_lines(SimpleNamespace(t=Translator("ru")), result.detail))
+        en = " ".join(fmt.explain_lines(SimpleNamespace(t=Translator("en")), result.detail))
+        self.assertIn("больше нет в списке устройств ADB", ru)
+        self.assertIn("is no longer listed by ADB", en)
+        self.assertEqual(len(self.adb.log), 1)
+
+
 class Scheduling(Base):
     instances = 6
 

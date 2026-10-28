@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Callable, Generic, TypeVar
 
 from app.core.errors import (CapabilityNotAvailable, EmergencyStopped, PlatformError,
-                             TargetNotVerified)
+                             TargetNotVerified, said_in)
 from app.decide import (Cancelled, Condition, ConditionalMacro, ConditionResult, MacroNode, Script, evaluate,
                         migrate_v1)
 from app.gui import flow_edit, flows, graph_edit, target_memory
@@ -57,6 +57,7 @@ from app.gui import explain, formatting
 from app.gui import history as run_history
 from app.gui import macro_edit
 from app.gui.history import RunHistory, TargetResult
+from app.gui.i18n import LANGUAGES
 from app.gui.library import LibraryError, MacroExists, MacroInfo, MacroLibrary, file_stamp
 from app.gui.macro_list import Filter, Scope, Sort, counts, visible
 from app.gui.meta import MacroMeta
@@ -69,6 +70,7 @@ from app.playback.engine import (ExecutionReport, PlaybackEngine, PlaybackRefuse
 from app.playback.macro import Macro
 from app.providers.base import Screenshot
 from app.providers.recording import Recorder, RecorderState, RecorderStateError, Recording
+from app.providers.remedy import Remedy, remedy_of
 from app.providers.size import SizeChanged
 from app.providers.target import Capability, Target, require_capability
 from app.vision.bitmap import encode_png
@@ -266,6 +268,28 @@ def _refusal_detail(issues, node: str | None = None) -> str:
     return explain.encode(first.code, node, dict(first.params), text.split(": ", 1)[1])
 
 
+@dataclass(frozen=True)
+class RemedyOffer:
+    """A provider's offer to fix what it refused for `ref` (app/providers/remedy.py), to ask the person once.
+    `reselect`: the refusal was a choice of target, chosen again once the fix is done."""
+    ref: str
+    remedy: Remedy
+    reselect: bool
+    listed: tuple = ()          # what the row said the target IS when it was refused (`_listed_as`)
+
+
+def _in_words(exc: BaseException, name: str) -> dict[str, str]:
+    """`exc`'s message as a sentence's values: `name` in English, `<name>_<code>` in each other language of the
+    screens (its own words when it carries them -- `PlatformError.said` -- else the English ones)."""
+    return {name: str(exc), **{f"{name}_{code}": said_in(exc, code) for code in LANGUAGES if code != "en"}}
+
+
+def _words_of(remedy: Remedy, words, name: str) -> dict[str, str]:
+    """A remedy's words as a sentence's values: `name` in English, `<name>_<code>` in each other language."""
+    return {name: remedy.said(words, "en"), **{f"{name}_{code}": remedy.said(words, code)
+                                               for code in LANGUAGES if code != "en"}}
+
+
 def _listed_as(entry: TargetEntry) -> tuple:
     """What a list row says a target IS. Its size and running state may change between two discoveries; these may
     not: the same token with other values names another target."""
@@ -399,6 +423,9 @@ class AppController:
         self.run_macro_key = ""
         self._run_queue: list[str] = []
         self._running: dict[str, PlaybackEngine | flows.FlowJob | flows.GraphJob] = {}   # ref -> its engine / job
+        self._run_identities: set[tuple[str, str]] = set()  # (provider, target id) of every target this run started
+        self.remedy_offer: RemedyOffer | None = None        # what a provider offered to fix after its last refusal
+        self.remedy_active = False                           # a fix the person said yes to is under way
         self._graph_macros: dict[str, Macro] = {}          # the recorded macros a v4 run's blocks name, by key
         self._lit_job: flows.GraphJob | None = None        # the v4 job whose blocks the editor lights
         self._run_flow: ConditionalMacro | None = None     # the v2 macro of the current run (None: a v1 run)
@@ -428,6 +455,8 @@ class AppController:
         detail = f"{type(exc).__name__}: {exc}" if exc is not None else ""
         if not key and getattr(exc, "key", ""):
             key, params = exc.key, dict(getattr(exc, "params", {}))
+        elif not key and getattr(exc, "said", None):
+            key, params = "msg_said", _in_words(exc, "said")       # a provider's own words, in the person's language
         self._say("error", category, text, detail, key, **params)
         return False
 
@@ -464,7 +493,7 @@ class AppController:
 
     @property
     def busy(self) -> bool:
-        return self.recording_active or self.playing or self.run_active
+        return self.recording_active or self.playing or self.run_active or self.remedy_active
 
     @property
     def emergency_active(self) -> bool:
@@ -521,23 +550,23 @@ class AppController:
         shown = self.macro_by_key(self.selected_key) if self.selected_key else None
         if shown is not None and not self.run_refs and self._targets_again(shown):
             dropped = False                       # the shown macro's remembered targets, listed now (item 12)
-        stale_note = stale_reason = ""
+        stale_note, stale_reason = "", {}
         if self.target is not None and self.target_status is TargetStatus.VERIFIED:
             try:
                 self.selected = self.services.recheck(self.target)
             except Exception as exc:
                 self.target_status = TargetStatus.STALE
                 stale_note = f" The selected window is no longer valid: {exc}"
-                stale_reason = str(exc)
+                stale_reason = _in_words(exc, "reason")
                 self._log(f"[stale_target] {exc}")
         if stale_note and dropped:
             self._say("warn", "stale_target", f"Found {len(self.entries)} target(s)." + stale_note + " Run targets "
                                               "that are gone or now name something else were dropped: choose them "
                                               "again.", key="msg_found_stale_dropped", count=len(self.entries),
-                      reason=stale_reason)
+                      **stale_reason)
         elif stale_note:
             self._say("warn", "stale_target", f"Found {len(self.entries)} target(s)." + stale_note,
-                      key="msg_found_stale", count=len(self.entries), reason=stale_reason)
+                      key="msg_found_stale", count=len(self.entries), **stale_reason)
         elif dropped:
             self._say("warn", "discovery", f"Found {len(self.entries)} target(s). Run targets that are gone or now "
                                            "name something else were dropped: choose them again.",
@@ -582,6 +611,7 @@ class AppController:
             return self._fail("busy", "The target cannot be changed while recording or playing.", key="msg_busy_target")
         previous_id = self.target.target_id if self.target is not None else None
         self.target, self.preview, self.preflight_lines = None, None, []
+        self.remedy_offer = None                   # an offer belongs to the refusal it came with
         if ref is None:
             self.selected, self.target_status = None, TargetStatus.NONE
             self.bound_target_id = None
@@ -601,6 +631,9 @@ class AppController:
             self.target, self.target_status = None, TargetStatus.INVALID
             self.bound_target_id = None
             self._keep_reading_for(None)
+            remedy = remedy_of(exc)
+            if remedy is not None:                 # the provider can fix it, if the person says yes (2026-10-27)
+                self.remedy_offer = RemedyOffer(ref, remedy, reselect=True, listed=_listed_as(entry))
             return self._explain(exc, "invalid_selection")
         self.target_status = TargetStatus.VERIFIED
         if previous_id != self.target.target_id:
@@ -631,7 +664,8 @@ class AppController:
             return None
         except Exception as exc:
             self.target_status = TargetStatus.STALE
-            self._fail("stale_target", f"The selected window is no longer valid ({exc}) Select it again.", exc, key="msg_target_stale", reason=str(exc))
+            self._fail("stale_target", f"The selected window is no longer valid ({exc}) Select it again.", exc,
+                       key="msg_target_stale", **_in_words(exc, "reason"))
             return None
         return self.target
 
@@ -1899,7 +1933,7 @@ class AppController:
         titles = {e.ref: (e.title or e.process) for e in self.entries}
         self.run_results = tuple(TargetRun(ref, titles.get(ref, ref), RunState.WAITING) for ref in self.run_refs)
         self.run_active, self.run_dry = True, dry_run
-        self._running = {}
+        self._running, self._run_identities = {}, set()
         self.run_macro_name, self.run_macro_key = macro.name or info.name, info.key
         self._run_queue = list(self.run_refs)
         self._run_started, self._run_actions = self._clock(), size
@@ -1975,9 +2009,20 @@ class AppController:
             self._set_run_result(ref, RunState.STOPPED, detail="emergency_stop")      # a stop is a stop, never a refusal
             return
         except Exception as exc:
-            self._set_run_result(ref, RunState.REFUSED, detail=f"{type(exc).__name__}: {exc}")
+            self._set_run_result(ref, RunState.REFUSED, detail=explain.of_error(exc))
             self._log(f"[run] {ref}: not verified ({exc})")
+            remedy = remedy_of(exc)
+            if remedy is not None and self.remedy_offer is None:     # asked once the run has ended
+                self.remedy_offer = RemedyOffer(ref, remedy, reselect=False, listed=_listed_as(entry))
             return
+        identity = (target.provider_id, target.target_id)
+        if identity in self._run_identities:
+            # two rows of the list can be one target (a device reached two ways, 2026-10-27): run once, never twice
+            self._set_run_result(ref, RunState.REFUSED, detail=explain.encode(
+                "same_target", message="This target is already in this run, chosen under another row of the list."))
+            self._log(f"[run] {ref}: the same target as another row of this run")
+            return
+        self._run_identities.add(identity)
         if self._run_flow is not None:
             return self._start_flow(ref, target)
         if target.provider_id != self.macro.target.provider_id:
@@ -1997,7 +2042,7 @@ class AppController:
                 return
             engine.start_in_background()
         except Exception as exc:
-            self._set_run_result(ref, RunState.REFUSED, detail=f"{type(exc).__name__}: {exc}")
+            self._set_run_result(ref, RunState.REFUSED, detail=explain.of_error(exc))
             return
         self._running[ref] = engine
         self._set_run_result(ref, RunState.RUNNING, total=self._run_actions)
@@ -2014,7 +2059,7 @@ class AppController:
         except EmergencyStopped:
             self._set_run_result(ref, RunState.STOPPED, detail="emergency_stop")
         except Exception as exc:
-            self._set_run_result(ref, RunState.REFUSED, detail=f"{type(exc).__name__}: {exc}")
+            self._set_run_result(ref, RunState.REFUSED, detail=explain.of_error(exc))
         return None
 
     def _start_flow(self, ref: str, target: Target) -> None:
@@ -2049,7 +2094,7 @@ class AppController:
                                 on_acting=self._escape.start if self._escape is not None else None)
             job.start_in_background()
         except Exception as exc:
-            self._set_run_result(ref, RunState.REFUSED, detail=f"{type(exc).__name__}: {exc}")
+            self._set_run_result(ref, RunState.REFUSED, detail=explain.of_error(exc))
             return
         self._running[ref] = job
         self._set_run_result(ref, RunState.RUNNING, total=self._run_actions)
@@ -2085,7 +2130,7 @@ class AppController:
                                  on_acting=self._escape.start if self._escape is not None else None)
             job.start_in_background()
         except Exception as exc:
-            self._set_run_result(ref, RunState.REFUSED, detail=f"{type(exc).__name__}: {exc}")
+            self._set_run_result(ref, RunState.REFUSED, detail=explain.of_error(exc))
             return
         self._running[ref] = job
         self._lit_job = job
@@ -2124,6 +2169,8 @@ class AppController:
 
     def run_from_editor(self, *, dry_run: bool = False) -> bool:
         """Run the version-4 script open in the editor -- saved, so what runs is the file -- on the chosen target."""
+        if self.busy:                               # before anything is chosen for it (the review of 2026-10-27)
+            return self._fail("busy", "A recording or run is already active.", key="msg_busy_active")
         if not self.editing_graph:
             return self._fail("editor", "No script is open.", key="msg_no_editor")
         if self.editing_new or self.editor_dirty:
@@ -2425,6 +2472,56 @@ class AppController:
             self._end_recorder()
             return self._say("warn", "cancelled", "Recording cancelled; nothing was kept.", key="msg_recording_cancelled")
         return self._say("info", "ready", "Nothing to cancel.", key="msg_nothing_to_cancel")
+
+    # ---- a provider's fix for what it refused, on the person's yes (the person's decision of 2026-10-27) -----------
+    def take_remedy_offer(self) -> RemedyOffer | None:
+        """The fix offered with the last refusal -- once, to ask the person -- when nothing is under way and the
+        emergency stop is not set (it is kept until then), else None."""
+        if self.busy or self.emergency_active or self.remedy_offer is None:
+            return None
+        offer, self.remedy_offer = self.remedy_offer, None
+        return offer
+
+    def begin_remedy(self, offer: RemedyOffer) -> Callable[[], None] | None:
+        """UI-thread gate, after the person's explicit yes: the work to run off the window's thread (`finish_remedy`
+        with what it returned or raised), or None with the reason said. Nothing else starts while it runs."""
+        if self.busy:
+            self._fail("busy", "Wait until what is under way has finished.", key="msg_busy_active")
+            return None
+        if self.emergency_active:
+            self._explain(EmergencyStopped("Emergency stop is active."), "emergency_stop")
+            return None
+        self.remedy_active = True
+        doing = offer.remedy.doing
+        self._say("info", "remedy", offer.remedy.said(doing, "en"), key="msg_remedy_running",
+                  **_words_of(offer.remedy, doing, "doing"))
+        return offer.remedy.run
+
+    def finish_remedy(self, outcome: object, offer: RemedyOffer) -> bool:
+        """What the fix came to: its own words when it failed or was stopped (what it had done by then), else done --
+        and the target it was for chosen again (a refused choice) or ready to run again (a refused run)."""
+        self.remedy_active = False
+        self._touch()
+        if isinstance(outcome, EmergencyStopped):
+            return self._fail("emergency_stop", str(outcome), outcome, key="msg_remedy_stopped",
+                              **_in_words(outcome, "what"))
+        if isinstance(outcome, BaseException):
+            return self._explain(outcome, "remedy")
+        done = _words_of(offer.remedy, offer.remedy.done, "done")
+        if self.emergency_active:                  # done, and the stop pressed meanwhile: what was done is still said
+            return self._fail("emergency_stop", done["done"] + " Reset the emergency stop, then choose the target.",
+                              key="msg_remedy_done_stopped", **done)
+        self.refresh()
+        if offer.reselect:
+            entry = self._entry_of(offer.ref)
+            if entry is None or _listed_as(entry) != offer.listed:
+                # a row names a target only within the discovery that issued it: never chosen for another one
+                return self._fail("invalid_selection", done["done"] + " Choose the target again.",
+                                  key="msg_remedy_done_choose", **done)
+            if not self.select(offer.ref):
+                return False                       # the choice says why
+            return self._say("ok", "verified", done["done"] + " Chosen and verified.", key="msg_remedy_done", **done)
+        return self._say("ok", "remedy", done["done"] + " Run it again.", key="msg_remedy_done_run", **done)
 
     def emergency_stop(self) -> bool:
         self.services.stop.trigger("GUI emergency stop")

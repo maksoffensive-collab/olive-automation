@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Mapping
 
 from app.core.cancel import EmergencyStop
-from app.core.errors import EmergencyStopped, PlatformError
+from app.core.errors import EmergencyStopped, PlatformError, said_params
 from app.observe.context import ObservationContext
 from app.observe.errors import (InvalidQuery, ObservationCancelled, ObservationUnavailable, OcrLanguageUnavailable,
                                 OcrUnavailable)
@@ -316,10 +316,11 @@ class _GraphRun:
             return self.report(FAILED, "ocr_unavailable", str(exc))
         except ObservationUnavailable as exc:
             self._mark(ERROR)
-            return self.report(FAILED, "observation_unavailable", str(exc))
+            return self.report(FAILED, "observation_unavailable", str(exc), said_params(exc))
         except PlatformError as exc:
             self._mark(ERROR)
-            return self.report(FAILED, getattr(exc, "reason_code", None) or type(exc).__name__, str(exc))
+            return self.report(FAILED, getattr(exc, "reason_code", None) or type(exc).__name__, str(exc),
+                               said_params(exc))
 
     def _mark(self, phase: str) -> None:
         if self.current is not None:

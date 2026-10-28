@@ -15,6 +15,8 @@ import json
 import re
 from dataclasses import dataclass, field
 
+from app.core.errors import said_params
+
 _HEAD = re.compile(r"(?P<reason>[A-Za-z][A-Za-z0-9_]*)(?:@(?P<node>[A-Za-z0-9_-]{1,32}))?")
 # the kind of a block, from the id the editor gives it (kind + number)
 _KIND = re.compile(r"(start|wait|check|repeat|click|macro|stop)\d*\Z")
@@ -31,6 +33,13 @@ class Detail:
     def node_kind(self) -> str:
         found = _KIND.match(self.node or "")
         return found.group(1) if found else ""
+
+
+def of_error(exc: BaseException) -> str:
+    """An error as a detail line: "<its type>: <words>", with its words in other languages when it carries them
+    (`PlatformError.said`), so a screen can say it in the person's language."""
+    said = said_params(exc)
+    return encode(type(exc).__name__, None, said, str(exc)) if said else f"{type(exc).__name__}: {exc}"
 
 
 def encode(reason: str, node: str | None = None, params=None, message: str = "") -> str:

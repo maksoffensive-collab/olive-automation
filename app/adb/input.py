@@ -134,7 +134,7 @@ class InputSession:
 
     def tap(self, x: int, y: int) -> None:
         if isinstance(x, bool) or isinstance(y, bool) or not isinstance(x, int) or not isinstance(y, int):
-            raise AdbError("Tap coordinates must be integers.")
+            raise AdbError("Tap coordinates must be integers.").saying(ru="Координаты нажатия должны быть целыми числами.")
         with self._lock:
             if not self._dry_run and self._sent >= self._budget:
                 raise InputBudgetExceeded(f"This input session allows {self._budget} action(s) and they are used up.")
@@ -143,7 +143,8 @@ class InputSession:
             # the target is CURRENTLY valid; only the tap itself and the budget are skipped below.
             display = self._read.display()
             if not (0 <= x < display.width and 0 <= y < display.height):
-                raise AdbError(f"Tap ({x}, {y}) is outside the {display.width}x{display.height} display; nothing sent.")
+                raise AdbError(f"Tap ({x}, {y}) is outside the {display.width}x{display.height} display; nothing sent.").saying(
+                    ru=f"Нажатие ({x}, {y}) за пределами экрана {display.width}x{display.height}; ничего не отправлено.")
             if self._dry_run:
                 self._intended.append(IntendedInput("tap", x=x, y=y))
                 return

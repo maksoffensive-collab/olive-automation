@@ -24,6 +24,7 @@ from app.core.process import CommandResult, Runner
 from app.logging.structured import Logger
 
 _SERIAL_RE = re.compile(r"^[A-Za-z0-9._:\-]{1,80}$")
+QUICK_LIST_TIMEOUT_S = 3.0      # `adb devices` answers in well under a second; a hint waits no longer than this
 _TRANSIENT = ("device offline", "closed", "protocol fault", "cannot connect", "device not found",
               "connection reset", "daemon not running")
 
@@ -125,7 +126,8 @@ def parse_devices(text: str) -> list[AdbDevice]:
             continue
         parts = line.split()
         if len(parts) < 2:
-            raise AdbError(f"Unexpected 'adb devices' line: {line!r}")
+            raise AdbError(f"Unexpected 'adb devices' line: {line!r}").saying(
+                ru=f"Непонятная строка в ответе «adb devices»: {line!r}")
         serial, raw_state = parts[0], parts[1]
         try:
             state = DeviceState(raw_state)
@@ -135,7 +137,8 @@ def parse_devices(text: str) -> list[AdbDevice]:
         out.append(AdbDevice(serial, state, raw_state, props))
     serials = [d.serial for d in out]
     if len(set(serials)) != len(serials):
-        raise AdbError("'adb devices' listed the same serial twice; refusing to continue.")
+        raise AdbError("'adb devices' listed the same serial twice; refusing to continue.").saying(
+            ru="«adb devices» показал один и тот же серийный номер дважды; продолжать нельзя.")
     return out
 
 
@@ -164,7 +167,7 @@ class AdbClient:
         self._allow_start = allow_server_start
         self._starting: threading.Thread | None = None      # a start in the background, while it runs
         self._starting_lock = threading.Lock()
-        self._start_failure: str | None = None               # why the last background start failed, until said
+        self._start_failure: PlatformError | None = None     # why the last background start failed, until said
 
     # ---- environment -------------------------------------------------
     @property
@@ -186,18 +189,19 @@ class AdbClient:
 
     def _require_binary(self) -> Path:
         if not self.binary_found():
-            raise AdbNotFound("adb.exe was not found. Check the LDPlayer folder in Settings.")
+            raise AdbNotFound("adb.exe was not found. Check the LDPlayer folder in Settings.").saying(
+                ru="adb.exe не найден. Проверьте папку LDPlayer в настройках.")
         return self._path  # type: ignore[return-value]
 
     # ---- command execution (timeout + bounded retry + logging) ------------
     def _run(self, args: list[str], *, retry: bool = True, serial: str | None = None,
-             operation: str = "ADB") -> CommandResult:
+             operation: str = "ADB", timeout_s: float | None = None) -> CommandResult:
         adb = self._require_binary()
         attempts = (self._retries if retry else 0) + 1
         result: CommandResult | None = None
         for attempt in range(1, attempts + 1):
             self._stop.check()
-            result = self._runner.run([str(adb), *args], timeout=self._timeout)
+            result = self._runner.run([str(adb), *args], timeout=timeout_s or self._timeout)
             transient = result.timed_out or (not result.ok and not result.cancelled and any(
                 t in (result.stderr_text + result.stdout_text).lower() for t in _TRANSIENT))
             if self._log:
@@ -229,13 +233,24 @@ class AdbClient:
         return AdbSnapshot(AdbStatus.DEVICES_PRESENT if devices else AdbStatus.NO_DEVICES, version, devices)
 
     def list_devices(self) -> list[AdbDevice]:
+        return self._list_devices(retry=True, timeout_s=self._timeout)
+
+    def list_devices_once(self, timeout_s: float = QUICK_LIST_TIMEOUT_S) -> list[AdbDevice]:
+        """`list_devices` for a hint that a person waits for (the list of targets): one try, never retried, at most
+        `timeout_s` (never more than the client's own timeout)."""
+        return self._list_devices(retry=False, timeout_s=min(timeout_s, self._timeout))
+
+    def _list_devices(self, *, retry: bool, timeout_s: float) -> list[AdbDevice]:
         if not self.server_running():
-            raise AdbServerNotRunning("The ADB server is not running, so no devices can be listed.")
-        result = self._run(["devices", "-l"], operation="ADB_DEVICES")
+            raise AdbServerNotRunning("The ADB server is not running, so no devices can be listed.").saying(
+                ru="Сервер ADB не запущен, поэтому список устройств получить нельзя.")
+        result = self._run(["devices", "-l"], retry=retry, operation="ADB_DEVICES", timeout_s=timeout_s)
         if result.timed_out:
-            raise AdbError(f"ADB did not answer within {self._timeout:g} s while listing devices.")
+            raise AdbError(f"ADB did not answer within {timeout_s:g} s while listing devices.").saying(
+                ru=f"ADB не ответил за {timeout_s:g} с, когда запрашивался список устройств.")
         if not result.ok:
-            raise AdbError(f"Listing ADB devices failed: {result.error or result.stderr_text.strip()}")
+            raise AdbError(f"Listing ADB devices failed: {result.error or result.stderr_text.strip()}").saying(
+                ru=f"Не удалось получить список устройств ADB: {result.error or result.stderr_text.strip()}")
         return parse_devices(result.stdout_text)
 
     def start_server(self) -> None:
@@ -244,7 +259,8 @@ class AdbClient:
             raise SafetyViolation("Starting the ADB server is not enabled for this client.")
         result = self._run(["start-server"], retry=False, operation="ADB_START_SERVER")
         if not result.ok:
-            raise AdbError(f"Could not start the ADB server: {result.error or result.stderr_text.strip()}")
+            raise AdbError(f"Could not start the ADB server: {result.error or result.stderr_text.strip()}").saying(
+                ru=f"Не удалось запустить сервер ADB: {result.error or result.stderr_text.strip()}")
 
     def start_server_soon(self) -> bool:
         """Start the server on a thread of its own and return at once: where a person waits -- the window's thread,
@@ -269,15 +285,19 @@ class AdbClient:
         except EmergencyStopped:
             return                                # the stop is no failure to report
         except Exception as exc:                 # adb's own failure (a port taken, adb.exe missing): kept, not raised
-            self._start_failure = str(exc)[:300] or type(exc).__name__
+            if self._stop.is_set():
+                return                            # a start the stop cancelled is no failure either
+            # kept as the error itself, so its words in other languages go with it (`said_in`)
+            self._start_failure = exc if isinstance(exc, PlatformError) else AdbError(
+                str(exc)[:300] or type(exc).__name__)
             if self._log:
                 self._log.warning("ADB_START_SERVER", result="FAILED", error=f"{type(exc).__name__}: {exc}"[:200])
         else:
             self._start_failure = None
 
-    def take_start_failure(self) -> str | None:
+    def take_start_failure(self) -> PlatformError | None:
         """Why the last background start failed -- said once, then forgotten, so the next choice tries again -- or
-        None (also while a start is under way)."""
+        None (also while a start is under way). `str()` of it is its English words."""
         with self._starting_lock:
             if self._starting is not None and self._starting.is_alive():
                 return None
@@ -294,9 +314,11 @@ class AdbClient:
         self._stop.check()
         result = self._run(["-s", serial, "exec-out", "screencap", "-p"], serial=serial, operation="ADB_SCREENCAP")
         if result.timed_out:
-            raise AdbError(f"Device {serial} did not deliver a screenshot within {self._timeout:g} s.")
+            raise AdbError(f"Device {serial} did not deliver a screenshot within {self._timeout:g} s.").saying(
+                ru=f"Устройство {serial} не прислало снимок экрана за {self._timeout:g} с.")
         if not result.ok:
-            raise AdbError(f"Screenshot from {serial} failed: {result.error or result.stderr_text.strip()}")
+            raise AdbError(f"Screenshot from {serial} failed: {result.error or result.stderr_text.strip()}").saying(
+                ru=f"Не удалось снять экран устройства {serial}: {result.error or result.stderr_text.strip()}")
         return result.stdout
 
     # ---- input (state-changing; requires an InputGrant) --------------------
@@ -308,14 +330,17 @@ class AdbClient:
             raise AdbError(f"'{serial}' is not a valid ADB serial.")
         for v in (x, y):
             if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 100000:
-                raise AdbError("Tap coordinates must be integers between 0 and 100000.")
+                raise AdbError("Tap coordinates must be integers between 0 and 100000.").saying(
+                    ru="Координаты нажатия должны быть целыми числами от 0 до 100000.")
         self._stop.check()
         result = self._run(["-s", serial, "shell", "input", "tap", str(x), str(y)], retry=False,
                            serial=serial, operation="ADB_INPUT_TAP")
         if result.timed_out:
-            raise AdbError(f"Device {serial} did not answer within {self._timeout:g} s; the tap may or may not have happened.")
+            raise AdbError(f"Device {serial} did not answer within {self._timeout:g} s; the tap may or may not have happened.").saying(
+                ru=f"Устройство {serial} не ответило за {self._timeout:g} с; нажатие могло пройти, а могло и нет.")
         if not result.ok:
-            raise AdbError(f"Tap on {serial} failed: {result.error or result.stderr_text.strip()}")
+            raise AdbError(f"Tap on {serial} failed: {result.error or result.stderr_text.strip()}").saying(
+                ru=f"Нажатие на устройстве {serial} не удалось: {result.error or result.stderr_text.strip()}")
 
     def input_keyevent(self, serial: str, keycode: int, *, grant: InputGrant) -> None:
         """Send exactly one `input keyevent <code>` -- a complete Android key press (down immediately followed by
@@ -327,15 +352,18 @@ class AdbClient:
         if not _SERIAL_RE.match(serial or ""):
             raise AdbError(f"'{serial}' is not a valid ADB serial.")
         if isinstance(keycode, bool) or not isinstance(keycode, int) or not 0 <= keycode <= 999:
-            raise AdbError("Android keycode must be an integer between 0 and 999.")
+            raise AdbError("Android keycode must be an integer between 0 and 999.").saying(
+                ru="Код клавиши Android должен быть целым числом от 0 до 999.")
         self._stop.check()
         result = self._run(["-s", serial, "shell", "input", "keyevent", str(keycode)], retry=False,
                            serial=serial, operation="ADB_INPUT_KEYEVENT")
         if result.timed_out:
             raise AdbError(f"Device {serial} did not answer within {self._timeout:g} s; "
-                           "the key press may or may not have happened.")
+                           "the key press may or may not have happened.").saying(
+                ru=f"Устройство {serial} не ответило за {self._timeout:g} с; клавиша могла нажаться, а могла и нет.")
         if not result.ok:
-            raise AdbError(f"Key event on {serial} failed: {result.error or result.stderr_text.strip()}")
+            raise AdbError(f"Key event on {serial} failed: {result.error or result.stderr_text.strip()}").saying(
+                ru=f"Нажатие клавиши на устройстве {serial} не удалось: {result.error or result.stderr_text.strip()}")
 
     def input_text(self, serial: str, text: str, *, grant: InputGrant) -> None:
         """Send exactly one `input text '<text>'`. `text` must already satisfy SAFE_TEXT_PATTERN (checked here
@@ -352,15 +380,19 @@ class AdbClient:
             raise AdbError(f"'{serial}' is not a valid ADB serial.")
         if not isinstance(text, str) or not SAFE_TEXT_PATTERN.match(text):
             raise AdbError("Text may contain only ASCII letters, digits, space, '.', ',', '_' and '-' "
-                           "(1..256 characters); nothing sent.")
+                           "(1..256 characters); nothing sent.").saying(
+                ru="Текст может содержать только латинские буквы, цифры, пробел и символы . , _ - "
+                   "(от 1 до 256 символов); ничего не отправлено.")
         self._stop.check()
         result = self._run(["-s", serial, "shell", "input", "text", f"'{text}'"], retry=False,
                            serial=serial, operation="ADB_INPUT_TEXT")
         if result.timed_out:
             raise AdbError(f"Device {serial} did not answer within {self._timeout:g} s; "
-                           "the text may or may not have been typed.")
+                           "the text may or may not have been typed.").saying(
+                ru=f"Устройство {serial} не ответило за {self._timeout:g} с; текст мог быть набран, а мог и нет.")
         if not result.ok:
-            raise AdbError(f"Typing text on {serial} failed: {result.error or result.stderr_text.strip()}")
+            raise AdbError(f"Typing text on {serial} failed: {result.error or result.stderr_text.strip()}").saying(
+                ru=f"Набор текста на устройстве {serial} не удался: {result.error or result.stderr_text.strip()}")
 
     # ---- read-only identity queries ------------------------------------
     def shell_query(self, serial: str, *command: str) -> str:
@@ -371,9 +403,11 @@ class AdbClient:
             raise SafetyViolation(f"Shell command {command[:3]!r} is not on the read-only allowlist.")
         result = self._run(["-s", serial, "shell", *command], serial=serial, operation="ADB_SHELL_QUERY")
         if result.timed_out:
-            raise AdbError(f"Device {serial} did not answer within {self._timeout:g} s.")
+            raise AdbError(f"Device {serial} did not answer within {self._timeout:g} s.").saying(
+                ru=f"Устройство {serial} не ответило за {self._timeout:g} с.")
         if not result.ok:
-            raise AdbError(f"Query on device {serial} failed: {result.error or result.stderr_text.strip()}")
+            raise AdbError(f"Query on device {serial} failed: {result.error or result.stderr_text.strip()}").saying(
+                ru=f"Запрос к устройству {serial} не удался: {result.error or result.stderr_text.strip()}")
         return result.stdout_text.replace("\r\n", "\n").strip()
 
     def getprop(self, serial: str, name: str) -> str:

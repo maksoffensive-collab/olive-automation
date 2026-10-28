@@ -191,6 +191,13 @@ class ProviderFailure(unittest.TestCase):
         self.assertEqual(report.reason, "observation_unavailable")
         self.assertEqual(r.input.calls, [])
 
+    def test_a_providers_russian_words_travel_with_a_failed_run(self):
+        """2026-10-27: the provider's own words in other languages reach the report (`params`), for the screens."""
+        gone = TargetNotVerified("The device is gone.", reason_code="device_gone").saying(ru="Устройства больше нет.")
+        report = Rig(fail=gone).run(Decision(Condition.pixel((1, 1), RED), then=TapMatch()))
+        self.assertEqual((report.state, report.reason), (FlowState.FAILED, "observation_unavailable"))
+        self.assertEqual(report.params, {"message_ru": "Устройства больше нет."})
+
     def test_a_wait_does_not_turn_a_capture_failure_into_a_timeout(self):
         r = Rig(fail=RuntimeError("device vanished"))
         report = r.run(WaitUntil(Condition.pixel((1, 1), RED), timeout_s=5, interval_s=0.05))

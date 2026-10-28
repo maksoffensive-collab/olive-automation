@@ -90,6 +90,9 @@ class App:
         self.root = root or tk.Tk()
         self.t = Translator(saved.get("language", "en"))
         self._confirm = confirm or (lambda title, text: messagebox.askyesno(title, text, parent=self.root))
+        # a question whose yes closes a program or leaves something half-done: "No" is the answer an Enter gives
+        self._confirm_careful = confirm or (lambda title, text: messagebox.askyesno(title, text, parent=self.root,
+                                                                                    default=messagebox.NO))
         self._open_folder = open_folder
         self._theme_hooks: list[Callable[[], None]] = []
         self._texts: list[tuple[tk.Widget, str]] = []
@@ -678,6 +681,21 @@ class App:
                 abandon()
             self._jobs.put((done, exc))
 
+    def _offer_remedy(self) -> None:
+        """A provider offered to fix what it has just refused (the person's decision of 2026-10-27): the person is
+        asked once, in their language, what will happen; only an explicit yes starts it, off the window's thread."""
+        c = self.controller
+        offer = c.take_remedy_offer()
+        if offer is None:
+            return
+        remedy, language = offer.remedy, self.t.language
+        if not self._confirm_careful(remedy.said(remedy.title, language), remedy.said(remedy.question, language)):
+            return
+        job = c.begin_remedy(offer)
+        self.render()
+        if job is not None:
+            self.run_job(job, lambda outcome: (c.finish_remedy(outcome, offer), self.render()))
+
     def _drain_jobs(self) -> None:
         while True:
             try:
@@ -710,6 +728,7 @@ class App:
             self._was_busy = busy
             if self.controller.version != self._rendered or busy:
                 self.render()
+            self._offer_remedy()
         finally:
             if self._after is not None:
                 self._after = self.root.after(POLL_MS, self._tick)
@@ -772,8 +791,11 @@ class App:
         A message with no key (a provider's own technical wording) is shown as it came, rather than being hidden."""
         status = status if status is not None else self.controller.status
         if status.key:
+            # a value given in this language too (`reason_ru` beside `reason`: a provider's own words) is said so
+            values = {name: status.values.get(f"{name}_{self.t.language}", value)
+                      for name, value in status.values.items()}
             try:
-                text = self.t(status.key).format(**status.values)
+                text = self.t(status.key).format(**values)
             except (KeyError, IndexError, ValueError):
                 return status.text
             why = status.values.get("why")          # a run that did not finish: why, in the person's words
@@ -797,6 +819,8 @@ class App:
                 done=sum(1 for r in c.run_results if r.state not in (RunState.WAITING, RunState.RUNNING)),
                 total=len(c.run_results)) if running else t("system_running_generic")
             colour = th.ACTIVE.warning
+        elif c.remedy_active:
+            text, colour = t("system_fixing"), th.ACTIVE.warning
         elif c.reading_text:
             text, colour = t("system_reading"), th.ACTIVE.info
         else:
@@ -845,6 +869,9 @@ class App:
 
     # ---- lifecycle -------------------------------------------------------------------------------------
     def close(self) -> None:
+        if self.controller.remedy_active and not self._confirm_careful(
+                self.t("dlg_close_while_fixing_title"), self.t("dlg_close_while_fixing")):
+            return                          # a fix half-done (a program closed, not started again): asked first
         self.controller.shutdown()
         if self._after is not None:
             self.root.after_cancel(self._after)

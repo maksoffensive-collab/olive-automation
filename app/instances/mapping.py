@@ -25,7 +25,7 @@ from typing import Callable
 
 from app.adb.client import AdbClient, AdbError, AdbServerNotRunning, DeviceState
 from app.core.cancel import EmergencyStop
-from app.core.errors import PlatformError, TargetNotVerified
+from app.core.errors import EmergencyStopped, PlatformError, TargetNotVerified, said_in
 from app.instances.profile import InstanceProfile, InstanceRegistry
 from app.ldplayer.config_reader import InstanceConfig, find_identity_conflicts
 from app.ldplayer.console import LDConsole, LDConsoleError, LDInstance
@@ -41,6 +41,13 @@ def _debug_off(label: str) -> str:
     return (f"{label} has ADB debugging turned off in its LDPlayer settings, so nothing can control it over ADB. In "
             "LDPlayer open Settings > Other settings > ADB debugging, choose \"Open local connection\", save, and "
             "restart the instance.")
+
+
+def _debug_off_ru(label: str) -> str:
+    return (f"У экземпляра {label} в настройках LDPlayer выключена отладка ADB, поэтому управлять им по ADB нельзя. "
+            "В LDPlayer откройте Settings > Other settings > ADB debugging (Настройки > Другие настройки > Отладка "
+            "ADB), выберите «Open local connection» (открыть локальное подключение), сохраните и перезапустите "
+            "экземпляр.")
 
 
 class Verdict(Enum):
@@ -101,14 +108,32 @@ class VerifiedTarget(Target):
 
 
 def adb_serial_ports(serial: str) -> list[int]:
-    """Ports that can belong to a serial: emulator-N -> N and N+1 (console, adb); host:N -> N."""
+    """Ports of THIS computer that can belong to a serial: emulator-N -> N and N+1 (console, adb); 127.x.x.x:N or
+    localhost:N -> N. Another computer's address gives none: its port N is not this computer's port N, so who owns
+    the port here proves nothing about the device there."""
     m = re.fullmatch(r"emulator-(\d+)", serial)
     if m:
         return [int(m.group(1)), int(m.group(1)) + 1]
-    m = re.fullmatch(r"[\w.\-]+:(\d+)", serial)
+    m = re.fullmatch(r"(?:127\.\d{1,3}\.\d{1,3}\.\d{1,3}|localhost):(\d+)", serial)
     if m:
         return [int(m.group(1))]
     return []
+
+
+def ways_by_instance(instances: list[LDInstance], serials: list[str],
+                     owners: dict[int, set[int]]) -> dict[int, list[str]]:
+    """{LDPlayer index: the ADB serials whose port here is owned by that instance's process}, LDPlayer's own
+    `emulator-N` first. For LISTING only -- one row per way when an instance has several; never evidence (only
+    `MappingService.verify` proves a serial, the identity included)."""
+    out: dict[int, list[str]] = {}
+    for serial in serials:
+        seen = set().union(*(owners.get(p, set()) for p in adb_serial_ports(serial)))
+        found = [i.index for i in instances if seen & {p for p in (i.pid, i.vbox_pid) if p and p > 0}]
+        if len(found) == 1:
+            out.setdefault(found[0], []).append(serial)
+    for ways in out.values():
+        ways.sort(key=lambda s: not s.startswith("emulator-"))
+    return out
 
 
 class MappingService:
@@ -138,7 +163,10 @@ class MappingService:
         try:
             actual = self._read_prop(serial, "phone.androidid")
             actual_imei = self._read_prop(serial, "phone.imei") if cfg.identity.imei else None
+        except EmergencyStopped:
+            raise                                   # the stop is the stop, never "identity unavailable"
         except (AdbError, PlatformError) as exc:
+            self._stop.check()                      # a stop that killed the query is the stop
             return Evidence("config_identity", Verdict.UNAVAILABLE, f"could not read device identity: {type(exc).__name__}")
         if actual is None:
             return Evidence("config_identity", Verdict.UNAVAILABLE, "device reported no injected Android ID")
@@ -163,11 +191,11 @@ class MappingService:
         return Evidence("process_owner", Verdict.MISMATCH, "serial's port is owned by a different process")
 
     # ---- verification -----------------------------------------------------
-    def _fail(self, profile: InstanceProfile, code: str, message: str) -> TargetNotVerified:
+    def _fail(self, profile: InstanceProfile, code: str, message: str, ru: str = "") -> TargetNotVerified:
         if self._log:
             self._log.bind(instance=profile.logical_id).warning("VERIFY_TARGET", result="REFUSED", error=message,
                                                                  reason_code=code)
-        return TargetNotVerified(message, reason_code=code)
+        return TargetNotVerified(message, reason_code=code).saying(ru=ru)
 
     def _console_call(self, profile: InstanceProfile, query: Callable):
         """Run an ldconsole query; a console failure is a typed refusal (never an untyped error, never a guess)."""
@@ -175,7 +203,8 @@ class MappingService:
             return query()
         except LDConsoleError as exc:
             self._stop.check()                      # a stop that killed the command is a stop, not a refusal
-            raise self._fail(profile, "ldconsole_error", f"ldconsole could not be queried: {exc}") from None
+            raise self._fail(profile, "ldconsole_error", f"ldconsole could not be queried: {exc}",
+                             f"Не удалось опросить ldconsole: {said_in(exc, 'ru')}") from None
 
     def _devices(self, profile: InstanceProfile) -> list:
         """The connected, authorised ADB devices. A server that is not running is started in the background when
@@ -191,22 +220,29 @@ class MappingService:
                 failure = getattr(self._adb, "take_start_failure", lambda: None)()
                 if failure is not None:             # said once; the next choice starts it again
                     raise self._fail(profile, "adb_server", f"{failure} Choose the instance again to try once "
-                                                            "more.") from None
+                                                            "more.",
+                                     f"{said_in(failure, 'ru')} Выберите экземпляр ещё раз, чтобы попробовать "
+                                     "снова.") from None
                 self._adb.start_server_soon()
                 raise self._fail(profile, "adb_starting",
                                  "The ADB server was not running; it is being started now. Choose the instance again "
-                                 "in a few seconds.") from None
+                                 "in a few seconds.",
+                                 "Сервер ADB не был запущен; сейчас он запускается. Выберите экземпляр ещё раз через "
+                                 "несколько секунд.") from None
             raise self._fail(profile, "adb_server",
-                             "The ADB server is not running, so the instance cannot be verified.") from None
+                             "The ADB server is not running, so the instance cannot be verified.",
+                             "Сервер ADB не запущен, поэтому экземпляр нельзя проверить.") from None
         except AdbError as exc:
             self._stop.check()                      # a stop that killed the command is a stop, not a refusal
-            raise self._fail(profile, "adb_error", f"ADB could not be queried: {exc}") from None
+            raise self._fail(profile, "adb_error", f"ADB could not be queried: {exc}",
+                             f"Не удалось опросить ADB: {said_in(exc, 'ru')}") from None
         return [d for d in listed if d.state is DeviceState.DEVICE]
 
     def _adb_debug_off(self, index: int) -> bool:
-        """Whether the instance's own settings say its ADB debugging is off (unknown or unreadable: not said)."""
+        """Whether the instance's own settings say its ADB debugging is off, "Close" or LDPlayer's default (unknown or
+        unreadable: not said)."""
         try:
-            return self._read_config(index).adb_debug == 0
+            return self._read_config(index).adb_debug_off
         except PlatformError:
             return False
 
@@ -219,19 +255,37 @@ class MappingService:
         _, inst, evidence_by_device, _ = self._gather(logical_id)
         return inst, evidence_by_device
 
-    def verify(self, logical_id: str) -> VerifiedTarget:
+    def verify(self, logical_id: str, serial: str | None = None) -> VerifiedTarget:
+        """Prove the instance and the ONE ADB serial to use. `serial`: the way the person chose (an instance reached
+        several ways) -- that serial and no other is proven, or the instance is refused; never replaced by another."""
         profile, inst, per_device, devices = self._gather(logical_id)
         label = profile.label()
-        matches = [(serial, evidence) for serial, evidence in per_device
+        matches = [(found, evidence) for found, evidence in per_device
                    if all(e.verdict is Verdict.MATCH for e in evidence)]
         if not matches and self._adb_debug_off(inst.index):
-            raise self._fail(profile, "adb_debug_off", _debug_off(label))
+            raise self._fail(profile, "adb_debug_off", _debug_off(label), _debug_off_ru(label))
+        if serial is not None:
+            matches = [m for m in matches if m[0] == serial]
+            if not matches:
+                raise self._fail(profile, "way_not_proven",
+                                 f"{label} can no longer be proven over ADB {serial} (that connection is gone or now "
+                                 "leads elsewhere). Refresh the list and choose it again. Not sending anything.",
+                                 f"{label} больше не подтверждается через ADB {serial} (это подключение пропало или "
+                                 "теперь ведёт в другое место). Обновите список и выберите заново. Ничего не "
+                                 "отправлено.")
         if not matches:
             raise self._fail(profile, "no_verified_serial",
                              f"None of the {len(devices)} connected ADB device(s) could be proven to be {label}. "
-                             "Not sending anything.")
+                             "Not sending anything.",
+                             f"Ни одно из подключённых устройств ADB (их {len(devices)}) не удалось подтвердить как "
+                             f"{label}. Ничего не отправлено.")
         if len(matches) > 1:
-            raise self._fail(profile, "ambiguous", f"{len(matches)} ADB devices all claim to be {label}. Refusing to pick one.")
+            ways = ", ".join(found for found, _ in matches)
+            raise self._fail(profile, "ambiguous",
+                             f"{label} can be reached {len(matches)} ways over ADB ({ways}). Refresh the list and choose "
+                             "which one to use. Not sending anything.",
+                             f"К экземпляру {label} ведёт несколько путей ADB ({ways}). Обновите список и выберите, "
+                             "через какой работать. Ничего не отправлено.")
 
         serial, evidence = matches[0]
         target = VerifiedTarget(profile.logical_id, inst.index, inst.name, serial, inst.pid, inst.vbox_pid,
@@ -246,40 +300,52 @@ class MappingService:
         self._stop.check()
         profile = self._registry.get(logical_id)
         if profile is None:
-            raise TargetNotVerified(f"'{logical_id}' is not a known instance.", reason_code="unknown_instance")
+            raise TargetNotVerified(f"'{logical_id}' is not a known instance.", reason_code="unknown_instance").saying(
+                ru=f"«{logical_id}» — неизвестный экземпляр.")
         label = profile.label()
 
         live = {i.index: i for i in self._console_call(profile, self._console.list_instances)}
         inst = live.get(profile.ld_index)
         if inst is None:
-            raise self._fail(profile, "not_in_ldplayer", f"LDPlayer has no instance with index {profile.ld_index} ({label}).")
+            raise self._fail(profile, "not_in_ldplayer", f"LDPlayer has no instance with index {profile.ld_index} ({label}).",
+                             f"В LDPlayer нет экземпляра с номером {profile.ld_index} ({label}).")
         if inst.name != profile.ld_name:
             raise self._fail(profile, "name_mismatch",
                              f"LDPlayer instance {profile.ld_index} is now named '{inst.name}', expected '{profile.ld_name}'. "
-                             "Refusing to guess which instance is meant.")
+                             "Refusing to guess which instance is meant.",
+                             f"Экземпляр LDPlayer № {profile.ld_index} теперь называется «{inst.name}», а ожидался "
+                             f"«{profile.ld_name}». Угадывать, какой имелся в виду, Olive не будет.")
         if inst.name not in self._console_call(profile, self._console.running_names):
-            raise self._fail(profile, "not_running", f"{label} (LDPlayer instance {inst.index}) is not running. Start it first.")
+            raise self._fail(profile, "not_running", f"{label} (LDPlayer instance {inst.index}) is not running. Start it first.",
+                             f"{label} (экземпляр LDPlayer № {inst.index}) не запущен. Сначала запустите его.")
 
         self._stop.check()
         devices = self._devices(profile)
         if not devices:
             if self._adb_debug_off(inst.index):
-                raise self._fail(profile, "adb_debug_off", _debug_off(label))
-            raise self._fail(profile, "no_adb_device", f"{label} is running but no ADB device is connected and authorised.")
+                raise self._fail(profile, "adb_debug_off", _debug_off(label), _debug_off_ru(label))
+            raise self._fail(profile, "no_adb_device", f"{label} is running but no ADB device is connected and authorised.",
+                             f"{label} запущен, но ни одно устройство ADB не подключено и не разрешено.")
 
         try:
             cfg = self._read_config(inst.index)
             configs = [self._read_config(i.index) for i in live.values()]
         except PlatformError as exc:
-            raise self._fail(profile, "config_unreadable", f"Instance configuration could not be read: {exc}") from None
+            raise self._fail(profile, "config_unreadable", f"Instance configuration could not be read: {exc}",
+                             f"Не удалось прочитать настройки экземпляра: {said_in(exc, 'ru')}") from None
         own = cfg.identity.android_id
         if own and inst.index in find_identity_conflicts(configs).get("android_id", []):
             raise self._fail(profile, "identity_not_unique",
-                             f"{label}'s Android ID is shared with another instance, so it cannot identify it.")
+                             f"{label}'s Android ID is shared with another instance, so it cannot identify it.",
+                             f"Android ID экземпляра {label} такой же, как у другого экземпляра, поэтому по нему "
+                             "нельзя узнать именно этот.")
         try:
             owners = self._port_owners()
+        except EmergencyStopped:
+            raise
         except PlatformError as exc:
-            raise self._fail(profile, "ports_unreadable", str(exc)) from None
+            self._stop.check()                      # a stop that killed the port listing is the stop
+            raise self._fail(profile, "ports_unreadable", str(exc), said_in(exc, "ru")) from None
 
         per_device: list[tuple[str, tuple[Evidence, ...]]] = []
         for dev in devices:
@@ -298,5 +364,7 @@ class MappingService:
         return targets
 
     def revalidate(self, target: VerifiedTarget) -> VerifiedTarget:
-        """Prove the target again (full check). Use after restarts or before long operations."""
-        return self.verify(target.logical_id)
+        """Prove the target again (full check) over the very serial it was proven on -- never another way to the
+        same instance, and not refused because another way appeared meanwhile. Use after restarts or before long
+        operations."""
+        return self.verify(target.logical_id, serial=target.adb_serial)

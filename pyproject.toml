@@ -1,6 +1,6 @@
 [project]
 name = "ldplayer-automation-platform"
-version = "0.9.0b2"            # the same as app.__version__ (tests.test_bootstrap_main.Version)
+version = "0.9.0b3"            # the same as app.__version__ (tests.test_bootstrap_main.Version)
 description = "Olive Automation: a provider-independent Windows automation platform"
 requires-python = ">=3.12,<3.13"
 dependencies = []

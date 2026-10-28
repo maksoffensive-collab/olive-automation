@@ -65,6 +65,49 @@ class Discovery(unittest.TestCase):
         self.assertIn("offline", offline.size)
         self.assertEqual(offline.group, "LDPlayer")          # still grouped, still listed, just honestly offline
 
+    def test_the_emergency_stop_in_one_providers_listing_is_the_stop_not_an_empty_list(self):
+        """The review of 2026-10-27: an empty LDPlayer list would drop every chosen LDPlayer target; another
+        provider's ordinary failure still just lists nothing."""
+        from app.core.errors import EmergencyStopped
+        composite, stop = two_provider_composite()
+        stop.trigger("test")                         # the LDPlayer side checks the stop before asking adb
+        with self.assertRaises(EmergencyStopped):
+            composite.discover()
+        composite, _ = two_provider_composite()
+        broken = composite._services[1]
+        broken.discover = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        self.assertEqual({e.provider_id for e in composite.discover()}, {"windows"})
+
+    def test_a_stop_during_a_listing_leaves_no_old_row_resolvable_through_a_new_table(self):
+        """The second review of 2026-10-27: Windows listed again, then LDPlayer met the stop -- the window keeps its
+        old rows, which must never resolve through the new tables (a reused window handle would be another window).
+        With the stop set before, nothing is listed again at all."""
+        from app.core.errors import EmergencyStopped
+        composite, stop = two_provider_composite()
+        old = composite.discover()
+        windows, ldplayer = composite._services
+        asked = []
+        listed = windows.discover
+        windows.discover = lambda: asked.append(1) or listed()
+        stop.trigger("test")
+        with self.assertRaises(EmergencyStopped):
+            composite.discover()
+        self.assertEqual(asked, [])                               # set before: no provider's table changed
+        stop.reset()
+        self.assertTrue(composite.verify(next(e for e in old if e.title == "Notes")))   # its own table, unchanged
+
+        def stops_midway():
+            stop.trigger("test")
+            raise EmergencyStopped("stopped while listing")
+        ldplayer.discover = stops_midway
+        with self.assertRaises(EmergencyStopped):
+            composite.discover()
+        self.assertEqual(len(asked), 1)                           # Windows had listed again before the stop
+        stop.reset()
+        for entry in old:
+            with self.subTest(entry=entry.title), self.assertRaises(TargetNotVerified):
+                composite.verify(entry)
+
     def test_refs_from_different_providers_never_collide_even_with_the_same_raw_ref(self):
         """A namespaced ref must always resolve back to the entry that issued it, never to a same-named one from
         a different provider (see CompositeAutomationServices' own docstring for why this matters)."""

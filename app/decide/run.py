@@ -48,7 +48,7 @@ from contextlib import AbstractContextManager, nullcontext
 from typing import Callable, Sequence
 
 from app.core.cancel import EmergencyStop
-from app.core.errors import EmergencyStopped, PlatformError, SafetyViolation
+from app.core.errors import EmergencyStopped, PlatformError, SafetyViolation, said_params
 from app.observe.context import ObservationContext
 from app.observe.errors import (InvalidQuery, ObservationCancelled, ObservationUnavailable, OcrLanguageUnavailable,
                                 OcrUnavailable)
@@ -118,6 +118,7 @@ class FlowReport:
     message: str = ""
     issues: tuple[Issue, ...] = field(default_factory=tuple)
     completed: int = 0                          # top-level steps that finished (all of them when COMPLETED)
+    params: dict = field(default_factory=dict)  # the message in other languages: {"message_ru": ...}
 
     @property
     def ok(self) -> bool:
@@ -127,9 +128,11 @@ class FlowReport:
 class _End(Exception):
     """Internal: stop the step loop with this outcome."""
 
-    def __init__(self, state: FlowState, reason: str, message: str = "", issues: tuple[Issue, ...] = ()) -> None:
+    def __init__(self, state: FlowState, reason: str, message: str = "", issues: tuple[Issue, ...] = (),
+                 params: dict | None = None) -> None:
         super().__init__(message)
         self.state, self.reason, self.message, self.issues = state, reason, message, issues
+        self.params = dict(params or {})
 
 
 def _check_binding(target: object, context: object) -> Target:
@@ -239,7 +242,9 @@ class _Run:
             raise _End(FlowState.CANCELLED, report.cancel_reason or "cancelled")
         if report.state is not PlaybackState.COMPLETED:
             failure = report.failure
-            raise _End(FlowState.FAILED, "action_failed", failure.message if failure else report.state.value)
+            said = {k: v for k, v in (failure.params if failure else ()) if k.startswith("message_")}
+            raise _End(FlowState.FAILED, "action_failed", failure.message if failure else report.state.value,
+                       params=said)
 
     def block(self, item, path: tuple) -> None:
         self.stop.check()
@@ -297,9 +302,10 @@ def run_steps(steps: Sequence[Step], *, target: Target, context: ObservationCont
     run = _Run(verified, context, create_playback, stop, cancel, dry_run, allow_different_target)
     finished = [0]
 
-    def end(state: FlowState, reason: str | None = None, message: str = "", issues=()) -> FlowReport:
+    def end(state: FlowState, reason: str | None = None, message: str = "", issues=(), params=None) -> FlowReport:
         completed = len(steps) if state is FlowState.COMPLETED else finished[0]
-        return FlowReport(state, verified.target_id, tuple(run.done), reason, message, tuple(issues), completed)
+        return FlowReport(state, verified.target_id, tuple(run.done), reason, message, tuple(issues), completed,
+                          dict(params or {}))
 
     try:
         # A question the run could never ask (text with no OCR reader, a language the reader cannot be asked for)
@@ -314,7 +320,7 @@ def run_steps(steps: Sequence[Step], *, target: Target, context: ObservationCont
                 run.block(step, (index,))
                 finished[0] = index + 1
     except _End as ended:
-        return end(ended.state, ended.reason, ended.message, ended.issues)
+        return end(ended.state, ended.reason, ended.message, ended.issues, ended.params)
     except EmergencyStopped as exc:
         return end(FlowState.CANCELLED, "emergency_stop", str(exc))
     except (Cancelled, ObservationCancelled) as exc:
@@ -326,7 +332,7 @@ def run_steps(steps: Sequence[Step], *, target: Target, context: ObservationCont
     except OcrUnavailable as exc:
         return end(FlowState.FAILED, "ocr_unavailable", str(exc))
     except ObservationUnavailable as exc:
-        return end(FlowState.FAILED, "observation_unavailable", str(exc))
+        return end(FlowState.FAILED, "observation_unavailable", str(exc), params=said_params(exc))
     except InvalidQuery as exc:
         return end(FlowState.FAILED, "invalid_query", str(exc))
     except DecisionError as exc:
@@ -336,5 +342,6 @@ def run_steps(steps: Sequence[Step], *, target: Target, context: ObservationCont
     except SizeChanged as exc:                    # the target's proportions changed during the run
         return end(FlowState.FAILED, "size_proportions_changed", str(exc))
     except PlatformError as exc:
-        return end(FlowState.FAILED, getattr(exc, "reason_code", None) or type(exc).__name__, str(exc))
+        return end(FlowState.FAILED, getattr(exc, "reason_code", None) or type(exc).__name__, str(exc),
+                   params=said_params(exc))
     return end(FlowState.COMPLETED)

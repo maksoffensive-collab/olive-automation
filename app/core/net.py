@@ -33,5 +33,7 @@ def listening_port_owners(runner: Runner, timeout_s: float = 15.0) -> dict[int, 
     exe = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "NETSTAT.EXE"
     result = runner.run([str(exe), "-ano", "-p", "tcp"], timeout=timeout_s)
     if not result.ok:
-        raise NetstatError(f"Could not read the list of open ports: {result.error or result.stderr_text.strip() or 'timeout'}")
+        why = result.error or result.stderr_text.strip() or 'timeout'
+        raise NetstatError(f"Could not read the list of open ports: {why}").saying(
+            ru=f"Не удалось прочитать список открытых портов: {why}")
     return parse_netstat_listeners(result.stdout_text)

@@ -586,8 +586,9 @@ class GraphEditorScreen:
         self.btn_undo.state(["!disabled"] if self.c.editor.can_undo and not running else ["disabled"])
         self.btn_redo.state(["!disabled"] if self.c.editor.can_redo and not running else ["disabled"])
         for button in (self.btn_run, self.btn_dry):
-            button.state(["disabled"] if running or self.c.recording_active else ["!disabled"])
-        self.btn_record.state(["disabled"] if running else ["!disabled"])
+            button.state(["disabled"] if running or self.c.recording_active or self.c.remedy_active
+                         else ["!disabled"])
+        self.btn_record.state(["disabled"] if running or self.c.remedy_active else ["!disabled"])
         self.btn_record.configure(text=t("graph_btn_record_stop" if self.c.recording_active else "graph_btn_record"))
         if self._recording_here and not self.c.recording_active:
             self.frame.after_idle(self._after_recording)      # ended by F10: name it and put its block in

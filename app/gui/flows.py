@@ -225,7 +225,7 @@ class FlowJob:
 
     def _outcome(self) -> tuple[str, int, str]:
         if self.error is not None:
-            return "failed", 0, f"{type(self.error).__name__}: {self.error}"
+            return "failed", 0, explain.of_error(self.error)
         report = self.report
         if report is None:
             return "stopped", 0, "the run ended before this target finished"
@@ -236,6 +236,8 @@ class FlowJob:
             reason = report.reason if report.reason == "emergency_stop" else (self.cancel_reason or "cancelled")
             return "stopped", done, reason
         detail = f"{report.reason}: {report.message}" if report.message else (report.reason or "failed")
+        if report.params and report.message:        # the words in other languages too (explain.py reads them back)
+            detail = explain.encode(report.reason or "failed", None, report.params, report.message)
         if report.issues:
             detail += " (" + "; ".join(f"{i.code}: {i.message}" for i in report.issues) + ")"
         if report.reason == "action_refused" and done == 0 and len(report.steps) <= 1:
@@ -386,7 +388,7 @@ class GraphJob:
 
     def _outcome(self) -> tuple[str, int, str]:
         if self.error is not None:
-            return "failed", 0, f"{type(self.error).__name__}: {self.error}"
+            return "failed", 0, explain.of_error(self.error)
         report = self.report
         if report is None:
             return "stopped", 0, "the run ended before this target finished"

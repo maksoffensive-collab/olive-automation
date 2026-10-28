@@ -66,6 +66,10 @@ class TargetEntry:
     single physical channel) leaves it at the default, and the scheduler then runs its targets strictly one at a
     time. The GUI reads this flag instead of asking which provider something came from."""
 
+    size_in: tuple[tuple[str, str], ...] = ()
+    """`size` in other languages, as (language code, words) pairs: a provider's note in the person's language.
+    Shown only, like `size`; never used to decide anything."""
+
 
 @runtime_checkable
 class AutomationServices(Protocol):

@@ -33,7 +33,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from app.core.cancel import EmergencyStop
-from app.core.errors import SafetyViolation, TargetNotVerified
+from app.core.errors import EmergencyStopped, SafetyViolation, TargetNotVerified
 from app.gui.services import AutomationServices, TargetEntry
 from app.playback.engine import PlaybackEngine
 from app.playback.macro import Macro
@@ -85,12 +85,23 @@ class CompositeAutomationServices:
 
     def discover(self) -> list[TargetEntry]:
         """Every provider is asked in turn; one provider's discovery failing never blinds the others -- it
-        simply lists nothing this time, exactly as it would if it had genuinely found no targets."""
+        simply lists nothing this time, exactly as it would if it had genuinely found no targets. The emergency stop
+        is not such a failure: it is raised as the stop (a list emptied by it would drop every chosen target).
+
+        The list rows the window holds stay valid only together with the table that issued them: while the stop is
+        set nothing is listed again (no provider's table changes), and a stop that arrives after an earlier provider
+        already listed again leaves NO row resolvable -- every old row is refused until a listing succeeds, never
+        resolved through another discovery's table (a window handle reused meanwhile would name another window;
+        the second review of 2026-10-27)."""
+        self._stop.check()
         self._by_ref = {}
         out: list[TargetEntry] = []
         for service in self._services:
             try:
                 entries = service.discover()
+            except EmergencyStopped:
+                self._by_ref = {}
+                raise
             except Exception:
                 continue
             out.extend(self._namespaced(service, e) for e in entries)

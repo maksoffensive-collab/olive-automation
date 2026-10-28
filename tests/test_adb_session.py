@@ -101,7 +101,8 @@ class SessionTests(unittest.TestCase):
         now[0] = 2e9
         with self.assertRaises(TargetNotVerified) as cm:
             s.android_version()
-        self.assertIn(cm.exception.reason_code, ("serial_changed", "device_gone"))
+        # the re-check proves the very serial in use (2026-10-27): it refuses before the session compares serials
+        self.assertIn(cm.exception.reason_code, ("way_not_proven", "serial_changed", "device_gone"))
 
     def test_stale_target_that_no_longer_verifies_is_refused(self):
         now = [0.0]

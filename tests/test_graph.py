@@ -166,6 +166,29 @@ def run(made, rig=None, *, macros=None, dry_run=False, clock=None, on_event=None
     return report, rig
 
 
+class SaidInOtherLanguages(unittest.TestCase):
+    """A provider's own words in other languages travel with a run that stopped (2026-10-27): the report's params
+    carry `message_<code>`, which the screens show in the person's language."""
+
+    def test_a_screen_that_could_not_be_read_keeps_the_providers_russian_words(self):
+        from app.core.errors import TargetNotVerified
+        gone = TargetNotVerified("The device is gone.", reason_code="device_gone").saying(ru="Устройства больше нет.")
+        report, rig = run(script(CheckNode("c", parts=(RED_AT,)), edges=(("s", NEXT, "c"),)), Rig(fail=gone))
+        self.assertEqual((report.state, report.reason), ("failed", "observation_unavailable"))
+        self.assertEqual(report.params.get("message_ru"), "Устройства больше нет.")
+        self.assertEqual(rig.input.calls, [])
+
+    def test_a_click_the_provider_refused_keeps_its_russian_words(self):
+        from app.core.errors import TargetNotVerified
+
+        def gone(*_args):
+            raise TargetNotVerified("The device is gone.", reason_code="device_gone").saying(ru="Устройства нет.")
+        report, _ = run(script(ClickNode("k", point=(5, 5), size=(200, 100)), edges=(("s", NEXT, "k"),)),
+                        Rig(on_call=gone))
+        self.assertEqual((report.state, report.reason), ("failed", "device_gone"), report.message)
+        self.assertEqual(report.params.get("message_ru"), "Устройства нет.")
+
+
 class Runs(unittest.TestCase):
     def test_found_leads_to_a_click_where_it_was_found(self):
         events = []

@@ -28,7 +28,8 @@ class Inst:
     pid: int = 1000
     vbox: int = 2000
     android_id: str | None = None
-    adb_debug: int | None = None      # LDPlayer's own "ADB debugging" setting; None = not in the file
+    adb_debug: int | str | None = 1   # LDPlayer's own "ADB debugging" setting (on, as any instance reached over ADB
+                                      # has it); None = not in the file
 
 
 @dataclass
@@ -351,20 +352,44 @@ class ServerAndDebugging(unittest.TestCase):
         with self.assertRaises(EmergencyStopped):
             make_service(w, stop=stop, adb=Killed(w)).verify("ld1")
 
+    def test_a_stop_that_ended_the_port_listing_or_the_identity_query_is_the_stop(self):
+        """The review of 2026-10-27: neither "ports unreadable" nor "identity unavailable" -- the stop."""
+        from app.core.net import NetstatError
+        for where in ("ports", "identity"):
+            with self.subTest(where=where):
+                w, stop = two_instance_world(), EmergencyStop()
+                svc = make_service(w, stop=stop)
+                if where == "ports":
+                    def ports():
+                        stop.trigger("test")
+                        raise NetstatError("cancelled")
+                    svc._port_owners = ports
+                else:
+                    class Killed(FakeAdb):
+                        def getprop(self, serial, name):
+                            stop.trigger("test")
+                            raise AdbError("ADB did not answer: cancelled")
+                    w.devices = w.devices[:1]           # one device: no later check of the stop could catch it
+                    svc._adb = Killed(w)
+                with self.assertRaises(EmergencyStopped):
+                    svc.verify("ld1")
+
     def test_adb_debugging_turned_off_in_the_instance_is_named_with_what_to_turn_on(self):
-        for others in (False, True):              # no device at all, or only another instance's
-            with self.subTest(others=others):
-                w = two_instance_world()
-                w.instances[0].adb_debug = 0
-                w.devices = w.devices[1:] if others else []
-                with self.assertRaises(TargetNotVerified) as cm:
-                    make_service(w).verify("ld1")
-                self.assertEqual(cm.exception.reason_code, "adb_debug_off")
-                self.assertIn("ADB debugging", str(cm.exception))
-                self.assertIn("restart", str(cm.exception))
+        # 0 = "Close"; None = not in the file: LDPlayer's default, which opens no ADB port (a new instance, 2026-10-27)
+        for setting in (0, None):
+            for others in (False, True):              # no device at all, or only another instance's
+                with self.subTest(setting=setting, others=others):
+                    w = two_instance_world()
+                    w.instances[0].adb_debug = setting
+                    w.devices = w.devices[1:] if others else []
+                    with self.assertRaises(TargetNotVerified) as cm:
+                        make_service(w).verify("ld1")
+                    self.assertEqual(cm.exception.reason_code, "adb_debug_off")
+                    self.assertIn("ADB debugging", str(cm.exception))
+                    self.assertIn("restart", str(cm.exception))
 
     def test_with_adb_debugging_on_or_not_known_the_reasons_stay_as_they_were(self):
-        for setting in (1, 2, None):
+        for setting in (1, 2, "x"):
             with self.subTest(setting=setting):
                 w = two_instance_world()
                 w.instances[0].adb_debug = setting
@@ -378,6 +403,81 @@ class ServerAndDebugging(unittest.TestCase):
         self.assertEqual(parse_instance_config(1, Path("x"), {"basicSettings.adbDebug": 1}).adb_debug, 1)
         self.assertIsNone(parse_instance_config(1, Path("x"), {}).adb_debug)
         self.assertIsNone(parse_instance_config(1, Path("x"), {"basicSettings.adbDebug": "x"}).adb_debug)
+
+    def test_off_is_close_or_not_in_the_file_and_a_value_not_understood_is_not_said(self):
+        off = {value: parse_instance_config(1, Path("x"), {"basicSettings.adbDebug": value}).adb_debug_off
+               for value in (0, 1, 2, "x")}
+        self.assertEqual(off, {0: True, 1: False, 2: False, "x": False})
+        self.assertTrue(parse_instance_config(1, Path("x"), {"statusSettings.playerName": "new"}).adb_debug_off)
+
+
+def two_way_world() -> World:
+    """LDPlayer-1 reached two ways, as seen live on 2026-10-27: its own `emulator-5554` and `127.0.0.1:5555` (what
+    `adb connect` to the same adb port adds); both are proven -- the same identity, the same port of its process."""
+    w = two_instance_world()
+    w.devices.append(Dev("127.0.0.1:5555", "aaaa1111", 1200))
+    return w
+
+
+class SeveralWays(unittest.TestCase):
+    """One instance reachable over several ADB serials: never guessed; the way the person chose is the one proven,
+    then and at every re-check -- never silently replaced by another (the person's rule of 2026-10-27: identical
+    targets, ask which one)."""
+
+    def test_two_ways_to_one_instance_are_never_chosen_between_by_olive(self):
+        with self.assertRaises(TargetNotVerified) as cm:
+            make_service(two_way_world()).verify("ld1")
+        self.assertEqual(cm.exception.reason_code, "ambiguous")
+        for word in ("emulator-5554", "127.0.0.1:5555", "choose"):
+            self.assertIn(word, str(cm.exception))
+
+    def test_the_way_the_person_chose_is_the_one_proven(self):
+        svc = make_service(two_way_world())
+        for serial in ("emulator-5554", "127.0.0.1:5555"):
+            with self.subTest(serial=serial):
+                target = svc.verify("ld1", serial=serial)
+                self.assertEqual((target.ld_index, target.adb_serial), (1, serial))
+                self.assertTrue(all(e.verdict is Verdict.MATCH for e in target.evidence))
+
+    def test_a_chosen_way_that_is_gone_or_belongs_to_another_instance_is_refused(self):
+        for serial, gone in (("127.0.0.1:5555", True), ("emulator-5556", False), ("emulator-5570", False)):
+            with self.subTest(serial=serial):
+                w = two_way_world()
+                if gone:
+                    w.devices = [d for d in w.devices if d.serial != serial]
+                with self.assertRaises(TargetNotVerified) as cm:
+                    make_service(w).verify("ld1", serial=serial)
+                self.assertEqual(cm.exception.reason_code, "way_not_proven")
+                self.assertIn(serial, str(cm.exception))
+
+    def test_a_re_check_proves_the_same_way_again_when_another_appears(self):
+        w = two_instance_world()
+        svc = make_service(w)
+        target = svc.verify("ld1")
+        w.devices.append(Dev("127.0.0.1:5555", "aaaa1111", 1200))      # a program ran `adb connect` meanwhile
+        self.assertEqual(svc.revalidate(target).adb_serial, "emulator-5554")
+
+    def test_a_re_check_never_moves_to_another_way(self):
+        w = two_way_world()
+        svc = make_service(w)
+        target = svc.verify("ld1", serial="127.0.0.1:5555")
+        w.devices = [d for d in w.devices if d.serial != "127.0.0.1:5555"]   # that way closed; the other is there
+        with self.assertRaises(TargetNotVerified) as cm:
+            svc.revalidate(target)
+        self.assertEqual(cm.exception.reason_code, "way_not_proven")
+
+    def test_a_way_through_another_computer_is_no_proof_of_this_ones_instance(self):
+        """`192.168.1.20:5555` is that computer's port 5555; the port of the same number here is owned by this
+        instance's process, but that proves nothing about the device behind the other address."""
+        w = two_instance_world()
+        w.devices.append(Dev("192.168.1.20:5555", "aaaa1111", None))
+        svc = make_service(w)
+        self.assertEqual(svc.verify("ld1").adb_serial, "emulator-5554")
+        _, per_device = svc.probe("ld1")
+        far = dict(per_device)["192.168.1.20:5555"]
+        self.assertNotEqual({e.kind: e.verdict for e in far}["process_owner"], Verdict.MATCH)
+        with self.assertRaises(TargetNotVerified):
+            svc.verify("ld1", serial="192.168.1.20:5555")
 
 
 class VerifiedTargetIntegrity(unittest.TestCase):
@@ -396,11 +496,16 @@ class VerifiedTargetIntegrity(unittest.TestCase):
         self.assertAlmostEqual(t.age_s(now=t.verified_at + 30), 30)
 
     def test_revalidate_detects_serial_change_after_restart(self):
+        """Since 2026-10-27 a re-check proves the very serial in use, so another serial is refused at once (before,
+        it was returned and the session then refused it as `serial_changed`): choosing again is the way on."""
         w = two_instance_world()
         svc = make_service(w)
         t = svc.verify("ld1")
         w.devices[0].serial = "emulator-5570"  # instance restarted and got another serial
-        self.assertEqual(svc.revalidate(t).adb_serial, "emulator-5570")
+        with self.assertRaises(TargetNotVerified) as cm:
+            svc.revalidate(t)
+        self.assertEqual(cm.exception.reason_code, "way_not_proven")
+        self.assertEqual(svc.verify("ld1").adb_serial, "emulator-5570")      # chosen again: proven on the new one
 
     def test_revalidate_refuses_when_instance_stopped(self):
         w = two_instance_world()
@@ -532,7 +637,10 @@ class HelperTests(unittest.TestCase):
     def test_serial_ports(self):
         self.assertEqual(adb_serial_ports("emulator-5554"), [5554, 5555])
         self.assertEqual(adb_serial_ports("127.0.0.1:5565"), [5565])
+        self.assertEqual(adb_serial_ports("localhost:5565"), [5565])
         self.assertEqual(adb_serial_ports("R58M123ABC"), [])
+        for far in ("192.168.1.20:5555", "10.0.0.7:5591", "phone.local:5555"):   # another computer's port
+            self.assertEqual(adb_serial_ports(far), [], far)
 
     def test_netstat_parser(self):
         text = ("  Proto  Local Address          Foreign Address        State           PID\r\n"

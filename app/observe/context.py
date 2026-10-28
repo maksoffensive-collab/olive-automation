@@ -127,7 +127,9 @@ class ObservationContext:
             except EmergencyStopped:
                 raise                          # cancellation is not a capture failure
             except PlatformError as exc:
-                raise ObservationUnavailable(f"Could not capture the screen of {self.target_id}: {exc}") from exc
+                # the provider's own words in other languages go along (the screens say "could not read" themselves)
+                raise ObservationUnavailable(f"Could not capture the screen of {self.target_id}: {exc}").saying(
+                    **exc.said) from exc
             except Exception as exc:
                 raise ObservationUnavailable(f"Could not capture the screen of {self.target_id}: "
                                              f"{type(exc).__name__}: {exc}") from exc

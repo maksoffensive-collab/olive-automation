@@ -51,7 +51,7 @@ from enum import Enum
 from typing import Callable
 
 from app.core.cancel import EmergencyStop
-from app.core.errors import EmergencyStopped, SafetyViolation
+from app.core.errors import EmergencyStopped, SafetyViolation, said_params
 from app.playback.macro import METHOD, ActionOp, Macro, MacroAction
 from app.playback.preflight import Issue, PreflightReport, preflight
 
@@ -375,7 +375,8 @@ class PlaybackEngine:
             code = getattr(exc, "reason_code", None) or type(exc).__name__
             self._finish(PlaybackState.FAILED, None, Failure(str(code), str(exc), index,
                                                              getattr(exc, "delivered", None), getattr(exc, "total", None),
-                                                             tuple(getattr(exc, "params", ()) or ())))
+                                                             tuple(getattr(exc, "params", ()) or ())
+                                                             + tuple(said_params(exc).items())))
             return False
         with self._cond:
             self._completed += 1
